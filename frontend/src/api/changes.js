@@ -1,0 +1,16 @@
+import api from './client';
+export const getChanges = (params) => api.get('/changes/', { params });
+export const getChange = (id) => api.get(`/changes/${id}/`);
+export const createChange = (data) => api.post('/changes/', data);
+export const updateChange = (id, data) => api.patch(`/changes/${id}/`, data);
+export const transitionChange = (id, status) => api.post(`/changes/${id}/transition/`, { status });
+export const getTasks = (id) => api.get(`/changes/${id}/tasks/`);
+export const createTask = (id, data) => api.post(`/changes/${id}/tasks/`, data);
+export const updateTask = (id, data) => api.patch(`/changes/tasks/${id}/`, data);
+export const deleteTask = (id) => api.delete(`/changes/tasks/${id}/`);
+export const uploadAttachment = (id, formData) => api.post(`/changes/${id}/attachments/`, formData, { headers: { 'Content-Type': 'multipart/form-data' } });
+export const addComment = (id, message) => api.post(`/changes/${id}/comments/`, { message });
+export const getActivity = (id) => api.get(`/changes/${id}/activity/`);
+export const getChangeCIs = (id) => api.get(`/changes/${id}/cis/`);
+export const addChangeCI = (id, data) => api.post(`/changes/${id}/cis/`, data);
+export const removeChangeCI = (ciLinkId) => api.delete(`/changes/cis/${ciLinkId}/`);

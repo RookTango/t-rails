@@ -1,0 +1,29 @@
+# ==========================================
+# Backend (Django)
+# ==========================================
+backend/**/__pycache__/
+backend/**/*.py[cod]
+backend/**/.env
+backend/db.sqlite3
+backend/media/
+
+# Ignore numbered migrations but keep __init__.py and the folder
+backend/*/migrations/[0-9]*.py
+
+# ==========================================
+# Frontend (React/Node)
+# ==========================================
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+frontend/.eslintcache
+frontend/*.log
+
+# ==========================================
+# Environment & IDEs
+# ==========================================
+.vscode/
+.idea/
+.env
+.DS_Store
+Thumbs.db

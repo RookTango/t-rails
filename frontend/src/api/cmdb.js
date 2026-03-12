@@ -1,0 +1,10 @@
+import api from './client';
+export const getCIs = (params) => api.get('/cmdb/', { params });
+export const searchCIs = (q) => api.get('/cmdb/search/', { params: { q } });
+export const getCI = (id) => api.get(`/cmdb/${id}/`);
+export const createCI = (data) => api.post('/cmdb/', data);
+export const updateCI = (id, data) => api.patch(`/cmdb/${id}/`, data);
+export const deleteCI = (id) => api.delete(`/cmdb/${id}/`);
+export const getCIImpact = (id, depth = 'full') => api.get(`/cmdb/${id}/impact/`, { params: { depth } });
+export const addRelationship = (data) => api.post('/cmdb/relationships/', data);
+export const deleteRelationship = (id) => api.delete(`/cmdb/relationships/${id}/`);
