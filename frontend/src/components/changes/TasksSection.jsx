@@ -1,4 +1,5 @@
 import { useState, useRef } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { Plus, Pencil, Trash2, ChevronDown, ChevronUp, Save, X, Search, Clock, CheckCircle2 } from 'lucide-react';
 import { createTask, updateTask, deleteTask } from '../../api/changes';
 import { searchCIs } from '../../api/cmdb';
@@ -50,7 +51,8 @@ function DateInput({ value, onChange, disabled }) {
     style={{ padding: '3px 5px', border: '1px solid #c0c8d4', borderRadius: 3, fontSize: 11, fontFamily: 'inherit', outline: 'none', width: '100%', background: disabled ? '#f9fafb' : '#fff' }} />;
 }
 
-function TaskRow({ task, onRefresh }) {
+function TaskRow({ task, onRefresh, changeId }) {
+  const navigate = useNavigate();
   const [expanded, setExpanded] = useState(false);
   const [editing,  setEditing]  = useState(false);
   const [form, setForm] = useState({
@@ -89,7 +91,7 @@ function TaskRow({ task, onRefresh }) {
             {expanded ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
           </button>
         </td>
-        <td style={{ padding: '6px 10px', fontSize: 11, fontFamily: 'JetBrains Mono, monospace', color: '#1565c0', whiteSpace: 'nowrap' }}>{task.task_number}</td>
+        <td style={{ padding: '6px 10px', fontSize: 11, fontFamily: 'JetBrains Mono, monospace', whiteSpace: 'nowrap' }}><button onClick={() => navigate(`/changes/${changeId}/tasks/${task.id}`)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--sn-blue)', fontFamily: 'JetBrains Mono, monospace', fontSize: 11, textDecoration: 'underline', padding: 0 }}>{task.task_number}</button></td>
         <td style={{ padding: '6px 10px', fontSize: 13 }}>
           {editing ? <input value={form.short_description} onChange={e => setForm(p => ({...p, short_description: e.target.value}))} style={inp} /> : task.short_description}
         </td>
@@ -223,7 +225,7 @@ export function TasksSection({ changeId, tasks, onRefresh }) {
               </tr>
             </thead>
             <tbody>
-              {tasks.map(task => <TaskRow key={task.id} task={task} onRefresh={onRefresh} />)}
+              {tasks.map(task => <TaskRow key={task.id} task={task} onRefresh={onRefresh} changeId={changeId} />)}
             </tbody>
           </table>
         </div>

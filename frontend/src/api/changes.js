@@ -14,3 +14,8 @@ export const getActivity = (id) => api.get(`/changes/${id}/activity/`);
 export const getChangeCIs = (id) => api.get(`/changes/${id}/cis/`);
 export const addChangeCI = (id, data) => api.post(`/changes/${id}/cis/`, data);
 export const removeChangeCI = (ciLinkId) => api.delete(`/changes/cis/${ciLinkId}/`);
+export const transitionTask = (id, status) => api.post(`/changes/tasks/${id}/transition/`, { status });
+export const getTask = (id) => api.get(`/changes/tasks/${id}/`);
+export const getTaskCIs = (id) => api.get(`/changes/tasks/${id}/cis/`);
+export const addTaskCI = (id, data) => api.post(`/changes/tasks/${id}/cis/`, data);
+export const removeTaskCI = (taskId, tciId) => api.delete(`/changes/tasks/${taskId}/cis/${tciId}/`);

@@ -22,7 +22,7 @@ VALID_TRANSITIONS = {
 # Role-based permissions per transition
 # Format: { 'TO_STATUS': [allowed_roles] }  — empty list = any authenticated user
 TRANSITION_ROLE_REQUIRED = {
-    'ASSESS':    ['IMPLEMENTER', 'CAB_MANAGER', 'ADMIN'],
+    'ASSESS':    ['REQUESTER', 'IMPLEMENTER', 'CAB_MEMBER', 'CAB_MANAGER', 'ADMIN'],  # Requester submits their own change
     'AUTHORIZE': ['CAB_MEMBER', 'CAB_MANAGER', 'ADMIN'],
     'SCHEDULED': ['CAB_MANAGER', 'ADMIN'],
     'IMPLEMENT': ['IMPLEMENTER', 'CAB_MANAGER', 'ADMIN'],
@@ -129,6 +129,58 @@ class ChangeTransitionView(APIView):
             message=f'Status changed from {old_status} to {new_status}.',
             metadata={'old_status': old_status, 'new_status': new_status}
         )
+
+        # Auto-generate Watson checklist when entering AUTHORIZE (if none exists)
+        if new_status == 'AUTHORIZE':
+            try:
+                from watson.models import WatsonChecklist
+                from watson.engine.factory import get_watson_engine
+                active_cl = WatsonChecklist.objects.filter(
+                    change=change
+                ).exclude(status=WatsonChecklist.Status.SUPERSEDED).first()
+
+                if not active_cl:
+                    # Reload change with full relations for watson payload
+                    change_full = ChangeRequest.objects.prefetch_related(
+                        'tasks', 'attachments', 'change_cis__ci', 'activity_logs'
+                    ).get(pk=change.pk)
+
+                    from watson.views import _build_payload
+                    payload = _build_payload(change_full)
+                    engine  = get_watson_engine()
+                    result  = engine.generate_checklist(payload)
+
+                    from watson.models import ChecklistGroup, ChecklistItem
+                    cl = WatsonChecklist.objects.create(
+                        change=change, status=WatsonChecklist.Status.DRAFT,
+                        generated_by=result.get('model', 'watson-auto'),
+                        confidence=result.get('confidence'),
+                        source_notes=result.get('source_notes', ''),
+                        json_artifact=result,
+                    )
+                    task_map = {t.id: t for t in change_full.tasks.all()}
+                    for g_order, gd in enumerate(result.get('groups', [])):
+                        task_obj = task_map.get(gd.get('task_ref'))
+                        grp = ChecklistGroup.objects.create(
+                            checklist=cl, code=gd['code'], title=gd['title'],
+                            phase=gd.get('phase',''), group_type=gd.get('group_type','PRE'),
+                            task=task_obj, order=g_order,
+                        )
+                        for i_order, item in enumerate(gd.get('items',[])):
+                            ChecklistItem.objects.create(
+                                group=grp, code=item['code'], description=item['description'],
+                                rationale=item.get('rationale',''), command_hint=item.get('command_hint',''),
+                                caution=item.get('caution',''), order=item.get('order', i_order),
+                            )
+                    ActivityLog.objects.create(
+                        change=change, user=request.user, action_type='WATSON_ACTION',
+                        message=f'Watson auto-generated checklist on entering Authorize phase.',
+                        metadata={'model': result.get('model'), 'confidence': result.get('confidence')}
+                    )
+            except Exception as e:
+                # Never block the transition due to Watson errors
+                pass
+
         from .serializers import ChangeRequestSerializer as S
         return Response(S(change).data)
 
@@ -153,7 +205,7 @@ class ChangeTaskListCreateView(generics.ListCreateAPIView):
 
 
 class ChangeTaskDetailView(generics.RetrieveUpdateDestroyAPIView):
-    queryset = ChangeTask.objects.select_related('ci')
+    queryset = ChangeTask.objects.select_related('ci', 'assigned_to', 'change').prefetch_related('task_cis__ci')
 
     def get_serializer_class(self):
         return ChangeTaskCreateSerializer if self.request.method in ['PUT', 'PATCH'] else ChangeTaskSerializer
@@ -161,8 +213,21 @@ class ChangeTaskDetailView(generics.RetrieveUpdateDestroyAPIView):
     def perform_update(self, serializer):
         old = self.get_object()
         old_status = old.status
+        new_status = serializer.validated_data.get('status', old_status)
+
+        # Tasks can only be moved to terminal states during IMPLEMENT phase
+        terminal = ['Completed', 'Skipped', 'Cancelled']
+        if new_status in terminal and old_status not in terminal:
+            change_status = old.change.status
+            if change_status != 'IMPLEMENT':
+                from rest_framework.exceptions import ValidationError
+                raise ValidationError(
+                    f'Tasks can only be completed during the Implementation phase. '
+                    f'Current change status is {change_status}. '
+                    f'Move the change to Implement first.'
+                )
+
         task = serializer.save()
-        new_status = task.status
 
         # ── Auto actual_start / actual_end on task (issue #5) ──────
         if old_status != 'In Progress' and new_status == 'In Progress' and not task.actual_start:
@@ -289,4 +354,101 @@ class ChangeCIDeleteView(APIView):
         except ChangeCI.DoesNotExist:
             return Response({'error': 'Not found'}, status=404)
         cci.delete()
+        return Response(status=204)
+
+
+# ── Task Transition View ────────────────────────────────────────────────────
+
+TASK_VALID_TRANSITIONS = {
+    'Open':        ['In Progress', 'Skipped', 'Cancelled'],
+    'In Progress': ['Completed', 'Cancelled'],
+    'Completed':   [],
+    'Skipped':     [],
+    'Cancelled':   ['Open'],  # allow reopen
+}
+
+class ChangeTaskTransitionView(APIView):
+    def post(self, request, pk):
+        try:
+            task = ChangeTask.objects.select_related('change').get(pk=pk)
+        except ChangeTask.DoesNotExist:
+            return Response({'error': 'Not found'}, status=404)
+
+        new_status = request.data.get('status')
+        old_status = task.status
+        allowed = TASK_VALID_TRANSITIONS.get(old_status, [])
+
+        if new_status not in allowed:
+            return Response({'error': f'Cannot move task from {old_status} to {new_status}.'}, status=400)
+
+        # Enforce: terminal states only during IMPLEMENT
+        terminal = ['Completed', 'Skipped', 'Cancelled']
+        if new_status in terminal and task.change.status != 'IMPLEMENT':
+            return Response({
+                'error': f'Tasks can only be completed during the Implementation phase. '
+                         f'Change is currently in {task.change.status}.'
+            }, status=400)
+
+        task.status = new_status
+
+        if old_status != 'In Progress' and new_status == 'In Progress' and not task.actual_start:
+            task.actual_start = timezone.now()
+            if not task.change.actual_start:
+                task.change.actual_start = task.actual_start
+                task.change.save(update_fields=['actual_start'])
+
+        if new_status in terminal and not task.actual_end:
+            task.actual_end = timezone.now()
+            if all_tasks_closed(task.change) and not task.change.actual_end:
+                task.change.actual_end = task.actual_end
+                task.change.save(update_fields=['actual_end'])
+
+        task.save()
+
+        ActivityLog.objects.create(
+            change=task.change, user=request.user,
+            action_type='TASK_UPDATE',
+            message=f'Task {task.task_number}: {old_status} → {new_status}',
+            metadata={'task_id': task.id, 'old_status': old_status, 'new_status': new_status}
+        )
+        from .serializers import ChangeTaskSerializer as TS
+        return Response(TS(task).data)
+
+
+# ── Task CI management ──────────────────────────────────────────────────────
+
+from .models import TaskCI
+from .serializers import TaskCISerializer
+
+class TaskCIListCreateView(APIView):
+    """GET/POST /api/changes/tasks/<pk>/cis/"""
+    def get(self, request, pk):
+        cis = TaskCI.objects.filter(task_id=pk).select_related('ci')
+        return Response(TaskCISerializer(cis, many=True).data)
+
+    def post(self, request, pk):
+        try:
+            task = ChangeTask.objects.get(pk=pk)
+            ci   = ConfigurationItem.objects.get(pk=request.data.get('ci_id'))
+        except (ChangeTask.DoesNotExist, ConfigurationItem.DoesNotExist) as e:
+            return Response({'error': str(e)}, status=400)
+
+        tci, _ = TaskCI.objects.get_or_create(task=task, ci=ci,
+                                              defaults={'notes': request.data.get('notes','')})
+        ActivityLog.objects.create(
+            change=task.change, user=request.user,
+            action_type='TASK_UPDATE',
+            message=f'CI {ci.name} linked to task {task.task_number}',
+            metadata={'ci_id': ci.id, 'task_id': task.id}
+        )
+        return Response(TaskCISerializer(TaskCI.objects.filter(task=task).select_related('ci'), many=True).data, status=201)
+
+
+class TaskCIDeleteView(APIView):
+    """DELETE /api/changes/tasks/<task_pk>/cis/<pk>/"""
+    def delete(self, request, task_pk, pk):
+        try:
+            TaskCI.objects.get(pk=pk, task_id=task_pk).delete()
+        except TaskCI.DoesNotExist:
+            return Response({'error': 'Not found'}, status=404)
         return Response(status=204)

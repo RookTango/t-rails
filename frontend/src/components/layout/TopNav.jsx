@@ -6,7 +6,7 @@ import { getChanges } from '../../api/changes';
 import { searchCIs } from '../../api/cmdb';
 
 export function TopNav() {
-  const { user, signOut: logout } = useAuth();
+  const { user, logout } = useAuth();
   const navigate = useNavigate();
   const [query, setQuery]     = useState('');
   const [results, setResults] = useState({ changes: [], cis: [] });

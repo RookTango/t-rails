@@ -206,3 +206,17 @@ class ChangeCI(models.Model):
 
     def __str__(self):
         return f"{self.change.ticket_number} → {self.ci.name} ({self.role})"
+
+
+class TaskCI(models.Model):
+    """Links a CI directly to a specific task."""
+    task  = models.ForeignKey(ChangeTask, related_name='task_cis', on_delete=models.CASCADE)
+    ci    = models.ForeignKey('cmdb.ConfigurationItem', related_name='task_cis', on_delete=models.CASCADE)
+    notes = models.TextField(blank=True)
+    added_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ('task', 'ci')
+
+    def __str__(self):
+        return f"{self.task.task_number} → {self.ci.name}"

@@ -8,6 +8,7 @@ import ChangesListPage from './pages/ChangesListPage';
 import ChangeDetailPage from './pages/ChangeDetailPage';
 import NewChangePage from './pages/NewChangePage';
 import CMDBPage from './pages/CMDBPage';
+import TaskDetailPage from './pages/TaskDetailPage';
 import './index.css';
 
 function Layout({ children }) {
@@ -41,6 +42,7 @@ function AppRoutes() {
       <Route path="/changes/new" element={<ProtectedLayout><NewChangePage /></ProtectedLayout>} />
       <Route path="/changes/:id" element={<ProtectedLayout><ChangeDetailPage /></ProtectedLayout>} />
       <Route path="/cmdb" element={<ProtectedLayout><CMDBPage /></ProtectedLayout>} />
+      <Route path="/changes/:changeId/tasks/:taskId" element={<ProtectedLayout><TaskDetailPage /></ProtectedLayout>} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   );
