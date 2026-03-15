@@ -1,5 +1,5 @@
 import { NavLink } from 'react-router-dom';
-import { LayoutDashboard, FileStack, Plus, Cpu, Database, ChevronRight, ChevronDown } from 'lucide-react';
+import { LayoutDashboard, FileStack, Plus, Cpu, Database, ChevronRight, ChevronDown, HousePlug  } from 'lucide-react';
 import { useState } from 'react';
 
 const sections = [
@@ -21,6 +21,12 @@ const sections = [
     label: 'Watson.ai',
     items: [
       { to: '/watson', label: 'AI Governance', icon: Cpu },
+    ]
+  },
+  {
+    label: 'Watson.ai',
+    items: [
+      { to: '/integrations', label: 'Integrations', icon: HousePlug  },
     ]
   }
 ];

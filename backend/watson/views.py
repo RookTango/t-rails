@@ -25,7 +25,6 @@ def _build_payload(change):
     Caps long text fields to keep prompt tokens under control.
     Primary CI is determined by Django (not Watson) for P5 authority checks.
     """
-    # Determine primary CI for P5 — first Affected CI, prefer highest criticality
     affected_cis = change.change_cis.select_related('ci').filter(role='Affected')
     primary_ci = None
     for cc in affected_cis:
@@ -104,6 +103,61 @@ def _build_payload(change):
             for al in change.activity_logs.order_by('-created_at')[:50]
         ],
     }
+
+
+# ── Effective criteria resolver ────────────────────────────────────────────
+
+def _resolve_effective_criteria(item: ChecklistItem) -> str:
+    """
+    Resolve the criteria Phase 2 should validate against.
+
+    Priority order:
+      1. If item is MODIFIED and acceptance_note is non-empty → use human's note
+         (senior engineer has explicitly overridden the AI criteria)
+      2. If technical_criteria is set → use AI-generated criteria
+      3. Fall back to description as a last resort
+
+    This ensures human corrections in Authorize phase are honoured by
+    Phase 2 validation rather than ignored.
+    """
+    if item.acceptance == 'MODIFIED' and item.acceptance_note.strip():
+        return item.acceptance_note.strip()
+    if item.technical_criteria.strip():
+        return item.technical_criteria.strip()
+    return item.description
+
+
+# ── Correction examples for future checklist generation ───────────────────
+
+def _build_correction_examples(domain: str) -> str:
+    """
+    Find past human corrections for AI-generated items.
+    Injects them as few-shot examples to improve future generations.
+    Only used when enough corrections exist to be meaningful.
+    """
+    try:
+        corrections = ChecklistItem.objects.filter(
+            confidence_flag='AI-GENERATED',
+            acceptance='MODIFIED',
+        ).exclude(
+            acceptance_note=''
+        ).select_related(
+            'group__checklist'
+        ).order_by('-accepted_at')[:8]
+
+        if corrections.count() < 3:
+            return ''
+
+        lines = ['=== PAST HUMAN CORRECTIONS — learn from these ===']
+        for item in corrections:
+            lines.append(
+                f"Description: {item.description}\n"
+                f"AI criteria: {item.technical_criteria}\n"
+                f"Human corrected to: {item.acceptance_note}\n"
+            )
+        return '\n'.join(lines)
+    except Exception:
+        return ''
 
 
 # ── Checklist persistence helper ───────────────────────────────────────────
@@ -223,9 +277,16 @@ class GenerateChecklistView(APIView):
 
         # IBM Watson generation
         try:
-            payload  = _build_payload(change)
-            engine   = get_watson_engine()
-            result   = engine.generate_checklist(payload)
+            payload = _build_payload(change)
+
+            # Inject past human corrections as few-shot examples
+            domain = payload.get('category', 'generic').lower()
+            correction_examples = _build_correction_examples(domain)
+            if correction_examples:
+                payload['correction_examples'] = correction_examples
+
+            engine = get_watson_engine()
+            result = engine.generate_checklist(payload)
         except Exception as e:
             logger.exception(
                 f"Checklist generation failed for {change.ticket_number}: {e}"
@@ -284,10 +345,24 @@ class ChecklistItemAcceptView(APIView):
                 'error': 'acceptance must be ACCEPTED, REJECTED, or MODIFIED'
             }, status=400)
 
+        note = request.data.get('note', '')
+
         item.acceptance      = acceptance
-        item.acceptance_note = request.data.get('note', '')
+        item.acceptance_note = note
         item.accepted_by     = request.user
         item.accepted_at     = timezone.now()
+
+        # When a human modifies an item, their note becomes the effective
+        # technical_criteria for Phase 2 validation.
+        # This ensures the human's specific instructions are honoured,
+        # not the AI's original criteria.
+        if acceptance == 'MODIFIED' and note.strip():
+            item.technical_criteria = note.strip()
+            logger.info(
+                f"Item {item.code} technical_criteria overridden by "
+                f"{request.user.username}: {note[:80]}"
+            )
+
         item.save()
 
         # Promote checklist status
@@ -338,17 +413,22 @@ class PassiveScoreView(APIView):
         if not checklist:
             return Response({'error': 'No active checklist found.'}, status=404)
 
-        # Build items payload
+        # Build items payload — resolve effective criteria per item
         items_payload = []
         for group in checklist.groups.all():
             linked_task_status = group.task.status if group.task else None
             for item in group.items.all():
+                # Resolve effective criteria:
+                # MODIFIED items use the human's acceptance_note as criteria.
+                # This is the core of the human-override feedback loop.
+                effective_criteria = _resolve_effective_criteria(item)
+
                 items_payload.append({
                     'id':                 item.id,
                     'code':               item.code,
                     'description':        item.description,
                     'rationale':          item.rationale,
-                    'technical_criteria': item.technical_criteria,
+                    'technical_criteria': effective_criteria,
                     'confidence_flag':    item.confidence_flag,
                     'acceptance':         item.acceptance,
                     'impl_result':        item.impl_result,

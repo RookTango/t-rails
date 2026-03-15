@@ -24,6 +24,7 @@ INSTALLED_APPS = [
     'changes',
     'watson',
     'cmdb',
+    'integrations',
 ]
 
 MIDDLEWARE = [

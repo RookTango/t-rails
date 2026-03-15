@@ -4,6 +4,7 @@ import { ChevronLeft, Plus, Trash2 } from 'lucide-react';
 import { createChange } from '../api/changes';
 import { FormField, TextInput, SelectInput, TextArea, DateTimeInput } from '../components/common/FormField';
 import { CIPickerField } from '../components/cmdb/CIPickerField';
+import api from '../api/client';
 
 export default function NewChangePage() {
   const navigate = useNavigate();
@@ -30,20 +31,44 @@ export default function NewChangePage() {
 
   const btnBase = { padding: '6px 16px', borderRadius: 3, fontSize: 13, fontWeight: 600, cursor: 'pointer', fontFamily: 'inherit', border: 'none', display: 'inline-flex', alignItems: 'center', gap: 5 };
 
-  const handleSubmit = async () => {
-    if (!form.short_description.trim()) { setError('Short description is required.'); return; }
-    setSaving(true); setError('');
-    try {
-      const payload = {
-        ...form,
-        configuration_item: selectedCI?.name || '',
-      };
-      const r = await createChange(payload);
-      navigate(`/changes/${r.data.id}`);
-    } catch (e) {
-      setError(e.response?.data?.detail || JSON.stringify(e.response?.data) || 'Failed to create change');
-    } finally { setSaving(false); }
-  };
+const handleSubmit = async () => {
+  if (!form.short_description.trim()) { setError('Short description is required.'); return; }
+  setSaving(true); setError('');
+  try {
+    // Step 1 — create the change
+    const payload = {
+      ...form,
+      configuration_item: selectedCI?.name || '',
+    };
+    const r = await createChange(payload);
+    const changeId = r.data.id;
+
+    // Step 2 — create tasks sequentially
+    const validTasks = tasks.filter(t => t.short_description.trim());
+    for (let i = 0; i < validTasks.length; i++) {
+      const t = validTasks[i];
+      await api.post(`/changes/${changeId}/tasks/`, {
+        short_description: t.short_description,
+        description:       t.description,
+        assignment_group:  t.assignment_group,
+        ci:                t.ci?.id || null,
+        order:             i + 1,
+      });
+    }
+
+    // Step 3 — attach primary CI if selected
+    if (selectedCI) {
+      await api.post(`/changes/${changeId}/cis/`, {
+        ci_id: selectedCI.id,
+        role:  'Affected',
+      });
+    }
+
+    navigate(`/changes/${changeId}`);
+  } catch (e) {
+    setError(e.response?.data?.detail || JSON.stringify(e.response?.data) || 'Failed to create change');
+  } finally { setSaving(false); }
+};
 
   const sectionHdr = (label) => (
     <div style={{ background: '#e8ecf0', padding: '5px 10px', borderLeft: '3px solid var(--sn-blue)', fontSize: 12, fontWeight: 700, color: 'var(--sn-text-primary)', marginBottom: 8 }}>{label}</div>

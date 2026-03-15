@@ -9,7 +9,13 @@ class WatsonChecklist(models.Model):
         ACCEPTED   = 'ACCEPTED',   'Accepted'
         SUPERSEDED = 'SUPERSEDED', 'Superseded'
 
-    change        = models.ForeignKey('changes.ChangeRequest', related_name='watson_checklists', on_delete=models.CASCADE)
+    change = models.ForeignKey(
+    'changes.ChangeRequest',
+    related_name='watson_checklists',
+    on_delete=models.CASCADE,
+    null=True,
+    blank=True,
+    )
     status        = models.CharField(max_length=20, choices=Status.choices, default=Status.DRAFT)
     generated_at  = models.DateTimeField(auto_now_add=True)
     generated_by  = models.CharField(max_length=50, default='watson-mock-v1')
@@ -19,6 +25,17 @@ class WatsonChecklist(models.Model):
     accepted_by   = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True,
                                        related_name='accepted_checklists', on_delete=models.SET_NULL)
     accepted_at   = models.DateTimeField(null=True, blank=True)
+    source_change_id = models.CharField(
+        max_length=100, blank=True, db_index=True,
+        help_text='Change ID from external source system (protocol API)'
+    )
+    integration_app = models.ForeignKey(
+        'integrations.IntegrationApp',
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='checklists',
+        help_text='External app that created this checklist via protocol API'
+    )
 
     class Meta:
         ordering = ['-generated_at']
