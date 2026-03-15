@@ -89,6 +89,19 @@ class ChecklistItem(models.Model):
     impl_validated_at  = models.DateTimeField(null=True, blank=True)
     impl_auto_scored   = models.BooleanField(default=False)  # True = Watson did it passively
 
+    technical_criteria = models.TextField(
+    blank=True,
+    help_text="Hidden instruction for Phase 2 validator — not shown to implementer"
+    )
+    confidence_flag = models.CharField(
+        max_length=20,
+        default='HIGH',
+        choices=[
+            ('HIGH', 'High Confidence'),
+            ('AI-GENERATED', 'AI Generated — Needs Senior Review'),
+            ('UNSURE', 'Unsure — Requester Clarification Required'),
+        ]
+    )
     class Meta:
         ordering = ['order']
 

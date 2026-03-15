@@ -258,7 +258,7 @@ export function WatsonChecklist({ change }) {
   const [scoring, setScoring]     = useState(false);
   const [error, setError]         = useState('');
   const fileRef = useRef(null);
-  const scoreTimerRef = useRef(null);
+  
 
   const load = useCallback(() => {
     return getChecklist(change.id).then(r => setChecklist(r.data)).catch(() => setChecklist(null));
@@ -270,18 +270,7 @@ export function WatsonChecklist({ change }) {
   }, [load]);
 
   // Auto passive-score every 30s during IMPLEMENT phase
-  useEffect(() => {
-    if (change.status !== 'IMPLEMENT' || !checklist) return;
-    const run = () => {
-      setScoring(true);
-      passiveScore(change.id).then(r => {
-        if (r.data.scored > 0) setChecklist(r.data.checklist);
-      }).catch(() => {}).finally(() => setScoring(false));
-    };
-    run(); // run immediately on mount
-    scoreTimerRef.current = setInterval(run, 30000);
-    return () => clearInterval(scoreTimerRef.current);
-  }, [change.status, change.id, !!checklist]);
+
 
   const handleGenerate = async (jsonFile) => {
     setError('');
@@ -293,6 +282,16 @@ export function WatsonChecklist({ change }) {
       setError(e.response?.data?.error || 'Generation failed');
     } finally { setGenerating(false); }
   };
+
+  const handleScore = async () => {
+  setScoring(true);
+  try {
+    const r = await passiveScore(change.id);
+    if (r.data.checklist) setChecklist(r.data.checklist);
+  } catch (e) {
+    setError('Scoring failed — check activity stream has evidence.');
+  } finally { setScoring(false); }
+};
 
   const canRederive = change.status === 'NEW' || change.status === 'ASSESS' || change.status === 'DRAFT';
   const isAuthorize = change.status === 'AUTHORIZE';
@@ -390,14 +389,20 @@ export function WatsonChecklist({ change }) {
       )}
 
       {isImplement && checklist && (
-        <div style={{ background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 4, padding: '8px 14px', marginBottom: 12, fontSize: 12, color: '#14532d', display: 'flex', alignItems: 'flex-start', gap: 8 }}>
-          <Zap size={14} style={{ flexShrink: 0, marginTop: 1 }} />
-          <div>
-            <strong>Watson is watching.</strong> As you add work notes, complete tasks, and upload screenshots, Watson reads the activity stream and automatically validates checklist items.
-            You don't need to do anything extra — just work normally. The checklist updates every 30 seconds.
-          </div>
-        </div>
-      )}
+  <div style={{ background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 4, padding: '8px 14px', marginBottom: 12, fontSize: 12, color: '#14532d', display: 'flex', alignItems: 'center', gap: 10 }}>
+    <Zap size={14} style={{ flexShrink: 0 }} />
+    <div style={{ flex: 1 }}>
+      <strong>Watson is watching.</strong> Add work notes and complete tasks, then click Validate to score checklist items against the activity stream.
+    </div>
+    <button
+      onClick={handleScore}
+      disabled={scoring}
+      style={{ display: 'flex', alignItems: 'center', gap: 5, padding: '5px 14px', background: scoring ? '#e2e8f0' : '#16a34a', border: 'none', borderRadius: 4, color: scoring ? '#94a3b8' : '#fff', fontSize: 12, fontWeight: 600, cursor: scoring ? 'not-allowed' : 'pointer', fontFamily: 'inherit', flexShrink: 0 }}>
+      {scoring ? <Loader size={12} /> : <Zap size={12} />}
+      {scoring ? 'Validating…' : 'Validate Now'}
+    </button>
+  </div>
+)}
 
       {loading && <div style={{ padding: 30, textAlign: 'center', color: '#94a3b8', fontSize: 13 }}>Loading checklist…</div>}
 

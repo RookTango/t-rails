@@ -4,12 +4,12 @@ IBM watsonx.ai engine — calls Granite via the watsonx.ai REST API.
 Required settings (set in .env or environment):
     WATSON_MODE=ibm
     WATSON_API_KEY=<your IBM Cloud API key>
-    WATSON_URL=https://us-south.ml.cloud.ibm.com   (or your region)
+    WATSON_URL=https://eu-de.ml.cloud.ibm.com   (or your region)
     WATSON_PROJECT_ID=<your watsonx project ID>
 
 Optional:
     WATSON_MODEL_ID=ibm/granite-3-3-8b-instruct   (default)
-    WATSON_MAX_TOKENS=2000
+    WATSON_MAX_TOKENS=4000
 """
 
 import json
@@ -52,7 +52,8 @@ def _get_iam_token(api_key: str) -> str:
 def _extract_json(text: str) -> dict:
     """
     Robustly extract JSON from Watson response.
-    Handles markdown fences, preamble text, and trailing content.
+    Handles markdown fences, preamble text, trailing content,
+    and truncated responses (token limit hit mid-stream).
     """
     if not text:
         raise ValueError("Empty response from Watson")
@@ -72,10 +73,31 @@ def _extract_json(text: str) -> dict:
     if start != -1 and end != -1 and end > start:
         try:
             return json.loads(text[start:end + 1])
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Could not parse JSON from Watson response: {e}\nRaw: {text[:500]}")
+        except json.JSONDecodeError:
+            pass
 
-    raise ValueError(f"No JSON object found in Watson response: {text[:300]}")
+    # JSON was truncated mid-stream (token limit hit) — attempt recovery.
+    # Walk backwards from the end to find the last parseable subset,
+    # balancing braces as needed.
+    if start != -1:
+        fragment = text[start:]
+        for close_pos in range(len(fragment) - 1, 0, -1):
+            if fragment[close_pos] == '}':
+                candidate = fragment[:close_pos + 1]
+                opens  = candidate.count('{')
+                closes = candidate.count('}')
+                if closes < opens:
+                    candidate += '}' * (opens - closes)
+                try:
+                    parsed = json.loads(candidate)
+                    logger.warning("Watson JSON was truncated — recovered partial response")
+                    return parsed
+                except json.JSONDecodeError:
+                    continue
+
+    raise ValueError(
+        f"Could not parse JSON from Watson response: {text[:300]}"
+    )
 
 
 def _validate_checklist(data: dict) -> dict:
@@ -97,6 +119,8 @@ def _validate_checklist(data: dict) -> dict:
             item.setdefault('rationale', '')
             item.setdefault('command_hint', '')
             item.setdefault('caution', '')
+            item.setdefault('technical_criteria', '')
+            item.setdefault('confidence_flag', 'HIGH')
 
     data.setdefault('domain', 'generic')
     data.setdefault('confidence', 0.8)
@@ -107,14 +131,15 @@ def _validate_checklist(data: dict) -> dict:
 
 
 def _validate_scoring(data: dict) -> dict:
-    """Validate scoring response."""
+    """Validate and normalise scoring response."""
     result = data.get('result', 'CAUTION').upper()
     if result not in ('PASS', 'FAIL', 'CAUTION'):
         result = 'CAUTION'
     return {
-        'result':      result,
-        'watson_note': data.get('watson_note', 'Watson could not determine result.'),
-        'confidence':  float(data.get('confidence', 0.5)),
+        'result':             result,
+        'watson_note':        data.get('watson_note', 'Watson could not determine result.'),
+        'confidence':         float(data.get('confidence', 0.5)),
+        'principles_checked': data.get('principles_checked', {}),
     }
 
 
@@ -127,7 +152,7 @@ class IBMWatsonEngine(WatsonEngineBase):
         self.project_id = settings.WATSON_PROJECT_ID
         self.model_id   = getattr(settings, 'WATSON_MODEL_ID',
                                   'ibm/granite-3-3-8b-instruct')
-        self.max_tokens = int(getattr(settings, 'WATSON_MAX_TOKENS', 2000))
+        self.max_tokens = int(getattr(settings, 'WATSON_MAX_TOKENS', 8000))
 
         if not self.api_key:
             raise RuntimeError("WATSON_API_KEY is not set")
@@ -142,17 +167,28 @@ class IBMWatsonEngine(WatsonEngineBase):
         payload = {
             "model_id":   self.model_id,
             "project_id": self.project_id,
-            "input": f"<|system|>\n{system_prompt}\n<|user|>\n{user_prompt}\n<|assistant|>",
+            # Granite 3.x chat format
+            "input": (
+                f"<|start_of_role|>system<|end_of_role|>"
+                f"{system_prompt}"
+                f"<|end_of_text|>"
+                f"<|start_of_role|>user<|end_of_role|>"
+                f"{user_prompt}"
+                f"<|end_of_text|>"
+                f"<|start_of_role|>assistant<|end_of_role|>"
+            ),
             "parameters": {
-                "decoding_method": "greedy",
-                "max_new_tokens":  self.max_tokens,
+                "decoding_method":    "greedy",
+                "max_new_tokens":     self.max_tokens,
                 "repetition_penalty": 1.05,
-                "stop_sequences": [],
+                "stop_sequences":     ["}\n}}\n", "}\n}\n}"],
             }
         }
 
-        logger.info(f"Calling watsonx.ai: model={self.model_id}, "
-                    f"prompt_len={len(payload['input'])}")
+        logger.info(
+            f"Calling watsonx.ai: model={self.model_id}, "
+            f"prompt_len={len(payload['input'])}"
+        )
 
         resp = requests.post(
             endpoint,
@@ -162,21 +198,22 @@ class IBMWatsonEngine(WatsonEngineBase):
                 'Content-Type':  'application/json',
                 'Accept':        'application/json',
             },
-            timeout=60,
+            timeout=120,
         )
 
         if not resp.ok:
             logger.error(f"Watson API error {resp.status_code}: {resp.text[:500]}")
             resp.raise_for_status()
 
-        data = resp.json()
-        # watsonx.ai returns results[0].generated_text
+        data      = resp.json()
         generated = data.get('results', [{}])[0].get('generated_text', '')
-        logger.info(f"Watson response: {len(generated)} chars, "
-                    f"stop_reason={data.get('results',[{}])[0].get('stop_reason','')}")
+        logger.info(
+            f"Watson response: {len(generated)} chars, "
+            f"stop_reason={data.get('results', [{}])[0].get('stop_reason', '')}"
+        )
         return generated
 
-    # ── Build prompt context helpers ───────────────────────────────────────
+    # ── Prompt context builders ────────────────────────────────────────────
 
     def _build_tasks_section(self, tasks: list) -> str:
         if not tasks:
@@ -186,7 +223,7 @@ class IBMWatsonEngine(WatsonEngineBase):
             ci_info = f" | CI: {t['ci_name']} ({t['ci_type']})" if t.get('ci_name') else ''
             lines.append(f"Task {i}: {t['short_description']}{ci_info}")
             if t.get('description'):
-                lines.append(f"  Details: {t['description'][:300]}")
+                lines.append(f"  Details: {t['description'][:2000]}")
             if t.get('status'):
                 lines.append(f"  Status: {t['status']}")
         return '\n'.join(lines)
@@ -196,9 +233,20 @@ class IBMWatsonEngine(WatsonEngineBase):
             return "No CIs specified."
         lines = []
         for ci in cis:
-            parts = [ci.get('name', ''), ci.get('ci_type', ''),
-                     ci.get('environment', ''), ci.get('os', ''),
-                     f"criticality={ci.get('business_criticality', '')}"]
+            env          = ci.get('environment', '')
+            criticality  = ci.get('business_criticality', '')
+            requires_p5  = (
+                env.lower() in ('production', 'prod') or
+                criticality.lower() in ('critical', 'high')
+            )
+            parts = [
+                ci.get('name', ''),
+                ci.get('ci_type', ''),
+                env,
+                ci.get('os', ''),
+                f"criticality={criticality}",
+                f"requires_p5={'YES' if requires_p5 else 'NO'}",
+            ]
             lines.append(' | '.join(p for p in parts if p))
         return '\n'.join(lines)
 
@@ -206,9 +254,12 @@ class IBMWatsonEngine(WatsonEngineBase):
         if not activity:
             return "No activity recorded."
         lines = []
-        for entry in activity[:30]:  # cap at 30 entries
+        for entry in activity[:30]:
             ts = entry.get('created_at', '')[:19]
-            lines.append(f"[{ts}] {entry.get('action_type','')} — {entry.get('message','')[:200]}")
+            lines.append(
+                f"[{ts}] {entry.get('action_type', '')} — "
+                f"{entry.get('message', '')[:200]}"
+            )
         return '\n'.join(lines)
 
     # ── Public interface ───────────────────────────────────────────────────
@@ -217,90 +268,115 @@ class IBMWatsonEngine(WatsonEngineBase):
         tasks = change_data.get('tasks', [])
         cis   = change_data.get('cis', [])
 
+        # Use the CAB-approved change window for P1 temporal proof,
+        # not the planned execution slot.
+        change_window = (
+            f"{change_data.get('change_window_start', 'Not specified')} "
+            f"to {change_data.get('change_window_end', 'Not specified')}"
+        )
+
         user_prompt = CHECKLIST_USER.format(
-            ticket_number     = change_data.get('ticket_number', 'N/A'),
-            short_description = change_data.get('short_description', ''),
-            change_type       = change_data.get('change_type', 'Normal'),
-            priority          = change_data.get('priority', '3'),
-            risk_level        = change_data.get('risk_level', 'Medium'),
-            impact            = change_data.get('impact', ''),
-            category          = change_data.get('category', ''),
-            service           = change_data.get('service', ''),
-            description       = change_data.get('description', '') or 'Not provided',
+            ticket_number       = change_data.get('ticket_number', 'N/A'),
+            short_description   = change_data.get('short_description', ''),
+            change_type         = change_data.get('change_type', 'Normal'),
+            priority            = change_data.get('priority', '3'),
+            risk_level          = change_data.get('risk_level', 'Medium'),
+            impact              = change_data.get('impact', ''),
+            category            = change_data.get('category', ''),
+            service             = change_data.get('service', ''),
+            change_window       = change_window,
+            description         = change_data.get('description', '') or 'Not provided',
             implementation_plan = change_data.get('implementation_plan', '') or 'Not provided',
-            rollback_plan     = change_data.get('rollback_plan', '') or 'Not provided',
-            test_plan         = change_data.get('test_plan', '') or 'Not provided',
-            task_count        = len(tasks),
-            tasks_section     = self._build_tasks_section(tasks),
-            ci_count          = len(cis),
-            cis_section       = self._build_cis_section(cis),
+            rollback_plan       = change_data.get('rollback_plan', '') or 'Not provided',
+            test_plan           = change_data.get('test_plan', '') or 'Not provided',
+            task_count          = len(tasks),
+            tasks_section       = self._build_tasks_section(tasks),
+            ci_count            = len(cis),
+            cis_section         = self._build_cis_section(cis),
             attachments_section = build_attachments_section(
                 change_data.get('attachments_with_paths', [])
             ),
         )
 
         try:
-            raw = self._call(CHECKLIST_SYSTEM, user_prompt)
-            data = _extract_json(raw)
+            raw    = self._call(CHECKLIST_SYSTEM, user_prompt)
+            data   = _extract_json(raw)
             result = _validate_checklist(data)
             result['model'] = self.model_id
             return result
         except Exception as e:
             logger.exception(f"Watson checklist generation failed: {e}")
-            # Fall back to mock so the UI doesn't break
-            from .mock import MockWatsonEngine
-            logger.warning("Falling back to mock engine")
-            fallback = MockWatsonEngine().generate_checklist(change_data)
-            fallback['source_notes'] = (
-                f"⚠️ IBM Watson failed ({str(e)[:100]}). "
-                f"Showing mock checklist — review carefully. "
-                + fallback.get('source_notes', '')
-            )
-            fallback['model'] = f'mock-fallback (watson error)'
-            return fallback
+            raise
 
     def passive_score(self, change_data: dict, checklist_items: list) -> list:
         """Score items one at a time — batch would exceed context window."""
         results = []
 
-        activity_text = self._build_evidence_section(change_data.get('activity', []))
+        activity_text    = self._build_evidence_section(change_data.get('activity', []))
         attachments_text = ', '.join(
             a.get('filename', '') for a in change_data.get('attachments', [])
         ) or 'None'
+
+        # P5: Django already knows CI risk — don't make Watson guess
+        ci_env      = change_data.get('primary_ci_env', '').lower()
+        ci_name     = change_data.get('primary_ci_name', 'Not specified')
+        requires_p5 = (
+            ci_env in ('production', 'prod') or
+            change_data.get('risk_level', '').lower() in ('high', 'critical')
+        )
+        requires_p5_str = (
+            'YES — secondary sign-off artifact required'
+            if requires_p5 else 'NO'
+        )
+
+        # P1: use the CAB-approved window, not the planned execution slot
+        change_window = (
+            f"{change_data.get('change_window_start', 'Not specified')} "
+            f"to {change_data.get('change_window_end', 'Not specified')}"
+        )
 
         for item in checklist_items:
             if item.get('acceptance') not in ('ACCEPTED', 'MODIFIED'):
                 continue
             if item.get('impl_result') not in ('NOT_RUN', 'CAUTION'):
                 continue
+            
+            time.sleep(1.0)
 
-            # Build task status string
             linked_status = item.get('linked_task_status', '')
-            task_status = f"Linked task status: {linked_status}" if linked_status else "No linked task."
+            task_status   = (
+                f"Linked task status: {linked_status}"
+                if linked_status else "No linked task."
+            )
 
             user_prompt = SCORING_USER.format(
-                code        = item.get('code', ''),
-                description = item.get('description', ''),
-                rationale   = item.get('rationale', ''),
-                task_status = task_status,
-                evidence    = activity_text,
-                attachments = attachments_text,
+                code               = item.get('code', ''),
+                description        = item.get('description', ''),
+                rationale          = item.get('rationale', ''),
+                technical_criteria = item.get('technical_criteria', 'No specific criteria defined.'),
+                change_window      = change_window,
+                requires_p5        = requires_p5_str,
+                ci_name            = ci_name,
+                task_status        = task_status,
+                evidence           = activity_text,
+                attachments        = attachments_text,
             )
 
             try:
-                raw  = self._call(SCORING_SYSTEM, user_prompt)
-                data = _extract_json(raw)
+                raw    = self._call(SCORING_SYSTEM, user_prompt)
+                data   = _extract_json(raw)
                 scored = _validate_scoring(data)
                 results.append({
-                    'item_id':      item['id'],
-                    'result':       scored['result'],
-                    'watson_note':  scored['watson_note'],
-                    'evidence_used': activity_text[:300],
-                    'auto_scored':  True,
+                    'item_id':            item['id'],
+                    'result':             scored['result'],
+                    'watson_note':        scored['watson_note'],
+                    'confidence':         scored['confidence'],
+                    'principles_checked': scored['principles_checked'],
+                    'evidence_used':      activity_text[:300],
+                    'auto_scored':        True,
                 })
             except Exception as e:
                 logger.warning(f"Could not score item {item.get('code')}: {e}")
-                # Skip this item — don't fail the whole batch
                 continue
 
         return results
