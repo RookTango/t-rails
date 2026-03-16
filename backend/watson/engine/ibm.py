@@ -460,3 +460,144 @@ class IBMWatsonEngine(WatsonEngineBase):
                 continue
 
         return results
+    
+    #--------------- for deeper analysis ---------
+    def generate_checklist_deep(self, change_data: dict) -> dict:
+        """
+        Generate checklist using Llama 3.3 70B for deeper domain knowledge.
+        Uses Llama-specific structural instruction prompts.
+ 
+        IBM watsonx on-demand caps Llama 3.3 70B at 4000 tokens response.
+        Prompts are kept lean to maximise output within this constraint.
+        """
+        from .prompts_llama import CHECKLIST_SYSTEM_LLAMA, CHECKLIST_USER_LLAMA
+ 
+        original_model      = self.model_id
+        original_max_tokens = self.max_tokens
+        self.model_id   = 'meta-llama/llama-3-3-70b-instruct'
+        self.max_tokens = 3800  # stay under 4000 token cap
+ 
+        tasks = change_data.get('tasks', [])
+        cis   = change_data.get('cis', [])
+ 
+        change_window = (
+            f"{change_data.get('change_window_start', 'Not specified')} "
+            f"to {change_data.get('change_window_end', 'Not specified')}"
+        )
+ 
+        # Tighter truncation — leave more room for response within 4000 token cap
+        user_prompt = CHECKLIST_USER_LLAMA.format(
+            ticket_number       = change_data.get('ticket_number', 'N/A'),
+            short_description   = change_data.get('short_description', ''),
+            change_type         = change_data.get('change_type', 'Normal'),
+            priority            = change_data.get('priority', '3'),
+            risk_level          = change_data.get('risk_level', 'Medium'),
+            change_window       = change_window,
+            description         = self._truncate_context(change_data.get('description', ''), 400),
+            implementation_plan = self._truncate_context(change_data.get('implementation_plan', ''), 500),
+            rollback_plan       = self._truncate_context(change_data.get('rollback_plan', ''), 200),
+            test_plan           = self._truncate_context(change_data.get('test_plan', ''), 200),
+            task_count          = len(tasks),
+            tasks_section       = self._build_tasks_section(tasks),
+            ci_count            = len(cis),
+            cis_section         = self._build_cis_section(cis),
+            attachments_section = build_attachments_section(
+                change_data.get('attachments_with_paths', [])
+            ),
+        )
+ 
+        try:
+            raw    = self._call(CHECKLIST_SYSTEM_LLAMA, user_prompt)
+            data   = _extract_json(raw)
+            result = _validate_checklist(data, expected_task_count=len(tasks))
+            result['model']          = self.model_id
+            result['deep_analysis']  = True
+            return result
+        except Exception as e:
+            logger.exception(f"Deep analysis checklist generation failed: {e}")
+            raise
+        finally:
+            self.model_id   = original_model
+            self.max_tokens = original_max_tokens
+ 
+    def passive_score_deep(self, change_data: dict, checklist_items: list) -> list:
+        """
+        Score using Llama 3.3 70B Naysayer prompt.
+        Used for the jury comparison — compares Llama verdict against Granite.
+        """
+        from .prompts_llama import SCORING_SYSTEM_LLAMA, SCORING_USER_LLAMA
+ 
+        original_model      = self.model_id
+        original_max_tokens = self.max_tokens
+        self.model_id   = 'meta-llama/llama-3-3-70b-instruct'
+        self.max_tokens = 1000  # scoring responses are short
+ 
+        results     = []
+        score_delay = float(getattr(settings, 'WATSON_SCORE_DELAY', 1.0))
+ 
+        activity_text    = self._build_evidence_section(change_data.get('activity', []))
+        attachments_text = ', '.join(
+            a.get('filename', '') for a in change_data.get('attachments', [])
+        ) or 'None'
+ 
+        ci_env      = change_data.get('primary_ci_env', '').lower()
+        ci_name     = change_data.get('primary_ci_name', 'Not specified')
+        requires_p5 = (
+            ci_env in ('production', 'prod') or
+            change_data.get('risk_level', '').lower() in ('high', 'critical')
+        )
+        requires_p5_str = 'YES — secondary sign-off required' if requires_p5 else 'NO'
+ 
+        change_window = (
+            f"{change_data.get('change_window_start', 'Not specified')} "
+            f"to {change_data.get('change_window_end', 'Not specified')}"
+        )
+ 
+        for item in checklist_items:
+            if item.get('acceptance') not in ('ACCEPTED', 'MODIFIED'):
+                continue
+            if item.get('impl_result') not in ('NOT_RUN', 'CAUTION'):
+                continue
+ 
+            time.sleep(score_delay)
+ 
+            linked_status = item.get('linked_task_status', '')
+            task_status   = (
+                f"Linked task status: {linked_status}"
+                if linked_status else "No linked task."
+            )
+ 
+            user_prompt = SCORING_USER_LLAMA.format(
+                code               = item.get('code', ''),
+                description        = item.get('description', ''),
+                rationale          = item.get('rationale', ''),
+                technical_criteria = item.get('technical_criteria', 'No specific criteria defined.'),
+                change_window      = change_window,
+                requires_p5        = requires_p5_str,
+                ci_name            = ci_name,
+                task_status        = task_status,
+                evidence           = activity_text,
+                attachments        = attachments_text,
+            )
+ 
+            try:
+                raw    = self._call(SCORING_SYSTEM_LLAMA, user_prompt)
+                data   = _extract_json(raw)
+                scored = _validate_scoring(data)
+                results.append({
+                    'item_id':            item['id'],
+                    'result':             scored['result'],
+                    'watson_note':        scored['watson_note'],
+                    'confidence':         scored['confidence'],
+                    'principles_checked': scored['principles_checked'],
+                    'evidence_used':      activity_text[:300],
+                    'auto_scored':        True,
+                    'model':              'meta-llama/llama-3-3-70b-instruct',
+                })
+            except Exception as e:
+                logger.warning(f"Deep scoring failed for item {item.get('code')}: {e}")
+                continue
+ 
+        self.model_id   = original_model
+        self.max_tokens = original_max_tokens
+        return results

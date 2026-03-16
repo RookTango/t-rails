@@ -571,3 +571,329 @@ class ExportChecklistJSON(APIView):
             f'attachment; filename="t-rails-{change.ticket_number}.json"'
         )
         return resp
+    
+class GenerateChecklistDeepView(APIView):
+    """POST /api/watson/changes/<pk>/generate-deep/
+    Generates checklist using Llama 3.3 70B for demo/comparison.
+    Does NOT supersede the active checklist — result is display-only.
+    """
+    def post(self, request, pk):
+        try:
+            change = ChangeRequest.objects.prefetch_related(
+                'tasks', 'attachments', 'change_cis__ci', 'activity_logs'
+            ).get(pk=pk)
+        except ChangeRequest.DoesNotExist:
+            return Response({'error': 'Change not found'}, status=404)
+
+        try:
+            payload = _build_payload(change)
+            engine  = get_watson_engine()
+
+            if not hasattr(engine, 'generate_checklist_deep'):
+                return Response({
+                    'error': 'Deep analysis requires IBM Watson engine.',
+                    'hint':  'Set WATSON_MODE=ibm in .env'
+                }, status=400)
+
+            result = engine.generate_checklist_deep(payload)
+            # Return raw result — NOT saved to DB, display only
+            return Response(result, status=200)
+
+        except Exception as e:
+            logger.exception(f"Deep analysis failed for {change.ticket_number}: {e}")
+            return Response({
+                'error':  'Deep analysis failed.',
+                'detail': str(e)[:200],
+            }, status=502)
+        
+
+#------- Deep Laama ----
+def _apply_jury_logic(standard_items, deep_results: list) -> list:
+    """
+    Compare Granite and Llama scoring results.
+    Returns jury analysis: where models agree, disagree, or partially disagree.
+    
+    Disagreement rule:
+      - Granite PASS + Llama FAIL = CAUTION: Model Disagreement (escalate for review)
+      - Granite FAIL + Llama PASS = CAUTION: Model Disagreement (escalate for review)
+      - Both PASS = AGREE
+      - Both FAIL = AGREE
+      - Any CAUTION involved = PARTIAL
+    """
+    # Build lookup of deep results by item_id
+    deep_by_id = {r['item_id']: r for r in deep_results}
+    jury = []
+ 
+    for std_item in standard_items:
+        item_id    = std_item.get('id')
+        deep_result = deep_by_id.get(item_id)
+        if not deep_result:
+            continue
+ 
+        std_verdict   = std_item.get('impl_result', 'NOT_RUN')
+        llama_verdict = deep_result.get('result', 'NOT_RUN')
+ 
+        if std_verdict == llama_verdict:
+            agreement = 'AGREE'
+        elif 'CAUTION' in (std_verdict, llama_verdict):
+            agreement = 'PARTIAL'
+        elif {std_verdict, llama_verdict} == {'PASS', 'FAIL'}:
+            agreement = 'DISAGREE'
+        else:
+            agreement = 'PARTIAL'
+ 
+        jury.append({
+            'item_id':       item_id,
+            'item_code':     std_item.get('code', ''),
+            'granite_result': std_verdict,
+            'llama_result':   llama_verdict,
+            'llama_note':     deep_result.get('watson_note', ''),
+            'agreement':      agreement,
+            # Flag disagreements for human review
+            'needs_review':   agreement == 'DISAGREE',
+        })
+ 
+    return jury
+ 
+ 
+class GenerateChecklistDeepView(APIView):
+    """
+    POST /api/watson/changes/<pk>/generate-deep/
+    
+    Generates a deep analysis checklist using Llama 3.3 70B.
+    Saved as a separate WatsonChecklist with is_deep_analysis=True.
+    Does NOT supersede the active Granite checklist.
+    """
+    def post(self, request, pk):
+        try:
+            change = ChangeRequest.objects.prefetch_related(
+                'tasks', 'attachments', 'change_cis__ci', 'activity_logs'
+            ).get(pk=pk)
+        except ChangeRequest.DoesNotExist:
+            return Response({"error": "Change not found"}, status=404)
+ 
+        # Supersede any previous deep analysis for this change
+        WatsonChecklist.objects.filter(
+            change=change,
+            is_deep_analysis=True,
+        ).exclude(
+            status=WatsonChecklist.Status.SUPERSEDED
+        ).update(status=WatsonChecklist.Status.SUPERSEDED)
+ 
+        try:
+            payload = _build_payload(change)
+            engine  = get_watson_engine()
+ 
+            if not hasattr(engine, "generate_checklist_deep"):
+                return Response({
+                    "error": "Deep analysis requires IBM Watson engine.",
+                    "hint":  "Set WATSON_MODE=ibm in .env"
+                }, status=400)
+ 
+            result = engine.generate_checklist_deep(payload)
+ 
+        except Exception as e:
+            logger.exception(f"Deep analysis failed for {change.ticket_number}: {e}")
+            return Response({
+                "error":  "Deep analysis generation failed.",
+                "detail": str(e)[:200],
+            }, status=502)
+ 
+        # Save deep analysis checklist — separate from standard checklist
+        checklist = WatsonChecklist.objects.create(
+            change           = change,
+            status           = WatsonChecklist.Status.DRAFT,
+            generated_by     = result.get("model", "meta-llama/llama-3-3-70b-instruct"),
+            confidence       = result.get("confidence"),
+            source_notes     = result.get("source_notes", ""),
+            json_artifact    = result,
+            is_deep_analysis = True,
+            deep_model       = result.get("model", "meta-llama/llama-3-3-70b-instruct"),
+        )
+ 
+        task_map = {t.id: t for t in change.tasks.all()}
+        for g_order, gd in enumerate(result.get("groups", [])):
+            task_obj = task_map.get(gd.get("task_ref"))
+            group = ChecklistGroup.objects.create(
+                checklist  = checklist,
+                code       = gd["code"],
+                title      = gd["title"],
+                phase      = gd.get("phase", ""),
+                group_type = gd.get("group_type", "PRE"),
+                task       = task_obj,
+                order      = g_order,
+            )
+            for i_order, item in enumerate(gd.get("items", [])):
+                ChecklistItem.objects.create(
+                    group              = group,
+                    code               = item["code"],
+                    description        = item["description"],
+                    rationale          = item.get("rationale", ""),
+                    command_hint       = item.get("command_hint", ""),
+                    caution            = item.get("caution", ""),
+                    technical_criteria = item.get("technical_criteria", ""),
+                    confidence_flag    = item.get("confidence_flag", "HIGH"),
+                    order              = i_order,
+                )
+ 
+        ActivityLog.objects.create(
+            change      = change,
+            user        = request.user,
+            action_type = "WATSON_ACTION",
+            message     = (
+                f"Deep analysis (Llama 3.3 70B) generated: "
+                f"{sum(len(g.get('items',[])) for g in result.get('groups',[]))} items. "
+                f"Domain: {result.get('domain','unknown')}."
+            ),
+            metadata = {"model": result.get("model"), "deep_analysis": True}
+        )
+ 
+        return Response(WatsonChecklistSerializer(checklist).data, status=201)
+ 
+ 
+class ChecklistDeepDetailView(APIView):
+    """GET /api/watson/changes/<pk>/checklist-deep/"""
+    def get(self, request, pk):
+        qs = WatsonChecklist.objects.filter(
+            change_id=pk,
+            is_deep_analysis=True,
+        ).exclude(
+            status=WatsonChecklist.Status.SUPERSEDED
+        ).prefetch_related(
+            "groups__items__accepted_by", "groups__task"
+        ).order_by("-generated_at")
+ 
+        if not qs.exists():
+            return Response(None)
+        return Response(WatsonChecklistSerializer(qs.first()).data)
+ 
+ 
+class PassiveScoreDeepView(APIView):
+    """
+    POST /api/watson/changes/<pk>/passive-score-deep/
+    
+    Runs Llama 3.3 70B Naysayer scoring and compares with Granite results.
+    Returns jury analysis showing where models agree or disagree.
+    Disagreements are flagged for human review.
+    """
+    def post(self, request, pk):
+        try:
+            change = ChangeRequest.objects.prefetch_related(
+                "tasks", "attachments", "change_cis__ci", "activity_logs"
+            ).get(pk=pk)
+        except ChangeRequest.DoesNotExist:
+            return Response({"error": "Not found"}, status=404)
+ 
+        if change.status != "IMPLEMENT":
+            return Response({
+                "error": "Deep scoring only runs during IMPLEMENT phase."
+            }, status=400)
+ 
+        # Get the standard (Granite) checklist
+        standard_checklist = WatsonChecklist.objects.filter(
+            change=change,
+            is_deep_analysis=False,
+        ).exclude(
+            status=WatsonChecklist.Status.SUPERSEDED
+        ).order_by("-generated_at").first()
+ 
+        if not standard_checklist:
+            return Response({"error": "No standard checklist found. Generate one first."}, status=404)
+ 
+        # Build items payload from standard checklist
+        items_payload = []
+        std_items_for_jury = []
+        for group in standard_checklist.groups.prefetch_related("items").all():
+            linked_task_status = group.task.status if group.task else None
+            for item in group.items.all():
+                from watson.views import _resolve_effective_criteria
+                effective_criteria = _resolve_effective_criteria(item)
+                item_dict = {
+                    "id":                 item.id,
+                    "code":               item.code,
+                    "description":        item.description,
+                    "rationale":          item.rationale,
+                    "technical_criteria": effective_criteria,
+                    "confidence_flag":    item.confidence_flag,
+                    "acceptance":         item.acceptance,
+                    "impl_result":        item.impl_result,
+                    "linked_task_status": linked_task_status,
+                    "caution":            item.caution,
+                }
+                items_payload.append(item_dict)
+                std_items_for_jury.append(item_dict)
+ 
+        eligible = [
+            i for i in items_payload
+            if i["acceptance"] in ("ACCEPTED", "MODIFIED")
+            and i["impl_result"] not in ("NOT_RUN",)  # score even already-scored items for comparison
+        ]
+ 
+        if not eligible:
+            return Response({
+                "jury": [],
+                "message": "No accepted items to compare.",
+            })
+ 
+        payload = _build_payload(change)
+ 
+        try:
+            engine = get_watson_engine()
+            if not hasattr(engine, "passive_score_deep"):
+                return Response({
+                    "error": "Deep scoring requires IBM Watson engine."
+                }, status=400)
+            deep_results = engine.passive_score_deep(payload, eligible)
+        except Exception as e:
+            logger.exception(f"Deep scoring failed for {change.ticket_number}: {e}")
+            return Response({
+                "error":  "Deep scoring failed.",
+                "detail": str(e)[:200],
+            }, status=502)
+ 
+        # Apply jury logic — compare Granite vs Llama
+        jury = _apply_jury_logic(std_items_for_jury, deep_results)
+ 
+        # Count agreements
+        agree_count    = sum(1 for j in jury if j["agreement"] == "AGREE")
+        disagree_count = sum(1 for j in jury if j["agreement"] == "DISAGREE")
+        partial_count  = sum(1 for j in jury if j["agreement"] == "PARTIAL")
+ 
+        # Update standard checklist jury_verdict summary
+        if disagree_count > 0:
+            verdict = "DISAGREE"
+        elif partial_count > 0:
+            verdict = "PARTIAL"
+        else:
+            verdict = "AGREE"
+ 
+        WatsonChecklist.objects.filter(pk=standard_checklist.pk).update(
+            jury_verdict=verdict
+        )
+ 
+        ActivityLog.objects.create(
+            change      = change,
+            user        = request.user,
+            action_type = "WATSON_ACTION",
+            message     = (
+                f"Jury analysis complete: {agree_count} agree, "
+                f"{disagree_count} disagree, {partial_count} partial."
+            ),
+            metadata = {
+                "agree": agree_count,
+                "disagree": disagree_count,
+                "partial": partial_count,
+                "verdict": verdict,
+            }
+        )
+ 
+        return Response({
+            "jury":          jury,
+            "summary": {
+                "agree":    agree_count,
+                "disagree": disagree_count,
+                "partial":  partial_count,
+                "verdict":  verdict,
+            },
+            "needs_human_review": disagree_count > 0,
+        })
