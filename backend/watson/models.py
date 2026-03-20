@@ -139,3 +139,98 @@ class ChecklistItem(models.Model):
 
     def __str__(self):
         return f"{self.code}: {self.description[:60]}"
+
+ 
+class CABChallenge(models.Model):
+ 
+    class SourceType(models.TextChoices):
+        TASK     = 'TASK',     'Task'
+        RUNBOOK  = 'RUNBOOK',  'Runbook / Attachment'
+        BACKOUT  = 'BACKOUT',  'Backout Plan'
+        SCHEDULE = 'SCHEDULE', 'Schedule / Window'
+        SCOPE    = 'SCOPE',    'Declared Scope'
+        CI       = 'CI',       'Configuration Item'
+        GENERAL  = 'GENERAL',  'General'
+ 
+    class Severity(models.TextChoices):
+        CRITICAL = 'CRITICAL', 'Critical'
+        HIGH     = 'HIGH',     'High'
+        MEDIUM   = 'MEDIUM',   'Medium'
+ 
+    class Status(models.TextChoices):
+        OPEN       = 'OPEN',       'Open — awaiting justification'
+        JUSTIFIED  = 'JUSTIFIED',  'Justified — awaiting Watson evaluation'
+        SATISFIED  = 'SATISFIED',  'Satisfied — Watson accepted justification'
+        ESCALATED  = 'ESCALATED',  'Escalated — justification insufficient'
+ 
+    # Scope
+    change       = models.ForeignKey(
+        'changes.ChangeRequest',
+        on_delete=models.CASCADE,
+        related_name='cab_challenges',
+    )
+    linked_item  = models.ForeignKey(
+        'watson.ChecklistItem',
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='cab_challenges',
+        help_text='Checklist item this challenge maps to — updated on satisfaction',
+    )
+ 
+    # Challenge content
+    source_type          = models.CharField(max_length=20, choices=SourceType.choices)
+    source_ref           = models.CharField(
+        max_length=200,
+        help_text='Human-readable source reference e.g. "Task 2", "Runbook Step 4", "Backout Plan"'
+    )
+    finding              = models.TextField(
+        help_text='Specific observation Watson made — named evidence, not vague'
+    )
+    severity             = models.CharField(max_length=10, choices=Severity.choices)
+    acceptance_criteria  = models.TextField(
+        help_text='Exact sub-criteria Watson needs satisfied — numbered list'
+    )
+    order                = models.PositiveSmallIntegerField(default=0)
+ 
+    # Resolution
+    status               = models.CharField(
+        max_length=12, choices=Status.choices, default=Status.OPEN
+    )
+    justification        = models.TextField(
+        blank=True,
+        help_text='Response provided by CAB member or presenter'
+    )
+    resolution_note      = models.TextField(
+        blank=True,
+        help_text='Watson verdict — what was satisfied or what remains insufficient'
+    )
+    resolved_at          = models.DateTimeField(null=True, blank=True)
+    resolved_by          = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='resolved_cab_challenges',
+    )
+ 
+    # Audit
+    created_at   = models.DateTimeField(auto_now_add=True)
+    updated_at   = models.DateTimeField(auto_now=True)
+    resubmit_count = models.PositiveSmallIntegerField(
+        default=0,
+        help_text='How many times this challenge has been resubmitted'
+    )
+ 
+    class Meta:
+        ordering = ['order', '-severity', 'source_type']
+ 
+    def __str__(self):
+        return f"{self.change.ticket_number} | {self.source_ref} | {self.severity} | {self.status}"
+ 
+    @property
+    def is_resolved(self):
+        return self.status in (self.Status.SATISFIED, self.Status.ESCALATED)
+ 
+    @property
+    def severity_order(self):
+        return {'CRITICAL': 0, 'HIGH': 1, 'MEDIUM': 2}.get(self.severity, 3)
+ 

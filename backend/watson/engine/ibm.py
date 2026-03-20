@@ -601,3 +601,230 @@ class IBMWatsonEngine(WatsonEngineBase):
         self.model_id   = original_model
         self.max_tokens = original_max_tokens
         return results
+        
+    
+    def generate_cab_brief(self, change_data: dict, checklist_context: dict) -> str:
+        """
+        Generate a CAB Intelligence Brief in prose markdown format.
+ 
+        Uses Llama 3.3 70B for richer risk language and better anomaly detection.
+        Falls back to current model if Llama is unavailable.
+        Output is plain markdown text, not JSON.
+ 
+        Args:
+            change_data:       standard _build_payload() output
+            checklist_context: {domain, confidence, technical_flags} from existing checklist
+        """
+        from .prompts_cab import CAB_SYSTEM, CAB_USER
+ 
+        original_model      = self.model_id
+        original_max_tokens = self.max_tokens
+ 
+        # Use Llama for richer prose — better risk language and anomaly reasoning
+        # If on trial plan, Llama is capped at 4000 tokens which is fine for prose
+        self.model_id   = 'meta-llama/llama-3-3-70b-instruct'
+        self.max_tokens = 1200  # prose brief — 600 words needs ~800 tokens, headroom included
+ 
+        tasks = change_data.get('tasks', [])
+        cis   = change_data.get('cis', [])
+ 
+        # Build CI section — plain names only, no technical detail
+        ci_names = [ci.get('name', '') for ci in cis if ci.get('name')]
+        cis_section = ', '.join(ci_names) if ci_names else 'None declared'
+ 
+        # Build technical flags from checklist — translate for CAB use
+        flags = []
+        for flag in checklist_context.get('technical_flags', []):
+            flags.append(flag)
+        technical_flags = '; '.join(flags) if flags else 'None flagged'
+ 
+        change_window = (
+            f"{change_data.get('change_window_start', 'Not specified')} "
+            f"to {change_data.get('change_window_end', 'Not specified')}"
+        )
+ 
+        user_prompt = CAB_USER.format(
+            ticket_number       = change_data.get('ticket_number', 'N/A'),
+            change_type         = change_data.get('change_type', 'Normal'),
+            priority            = change_data.get('priority', '3'),
+            risk_level          = change_data.get('risk_level', 'Medium'),
+            short_description   = change_data.get('short_description', ''),
+            requester           = change_data.get('requester', 'Not specified'),
+            change_window       = change_window,
+            service             = change_data.get('service', 'Not specified'),
+            cis_section         = cis_section,
+            description         = self._truncate_context(change_data.get('description', ''), 400),
+            implementation_plan = self._truncate_context(change_data.get('implementation_plan', ''), 500),
+            rollback_plan       = self._truncate_context(change_data.get('rollback_plan', ''), 300),
+            test_plan           = self._truncate_context(change_data.get('test_plan', ''), 200),
+            tasks_section       = self._build_tasks_section(tasks),
+            attachments_section = build_attachments_section(
+                change_data.get('attachments_with_paths', [])
+            ),
+            domain              = checklist_context.get('domain', 'unknown'),
+            confidence          = f"{int(checklist_context.get('confidence', 0) * 100)}%",
+            technical_flags     = technical_flags,
+        )
+ 
+        try:
+            # CAB brief is prose — no JSON extraction needed
+            brief = self._call(CAB_SYSTEM, user_prompt)
+            return brief.strip()
+        except Exception as e:
+            # Fall back to current model if Llama fails
+            logger.warning(f"Llama CAB brief failed, falling back to {original_model}: {e}")
+            self.model_id   = original_model
+            self.max_tokens = min(original_max_tokens, 2000)
+            try:
+                brief = self._call(CAB_SYSTEM, user_prompt)
+                return brief.strip()
+            except Exception as e2:
+                logger.exception(f"CAB brief generation failed: {e2}")
+                raise
+        finally:
+            self.model_id   = original_model
+            self.max_tokens = original_max_tokens
+
+    def generate_cab_interrogation(self, change_data: dict, checklist_context: dict) -> dict:
+        """
+        Generate structured CABChallenge list using Llama 3.3 70B.
+        Returns JSON with overall_risk and challenges list.
+        """
+        from .prompts_cab import CAB_INTERROGATE_SYSTEM, CAB_INTERROGATE_USER
+ 
+        original_model      = self.model_id
+        original_max_tokens = self.max_tokens
+        self.model_id   = 'meta-llama/llama-3-3-70b-instruct'
+        self.max_tokens = 3000  # need room for multiple structured challenges
+ 
+        tasks = change_data.get('tasks', [])
+        cis   = change_data.get('cis', [])
+        ci_names = [ci.get('name', '') for ci in cis if ci.get('name')]
+ 
+        change_window = (
+            f"{change_data.get('change_window_start', 'Not specified')} "
+            f"to {change_data.get('change_window_end', 'Not specified')}"
+        )
+ 
+        flags = checklist_context.get('technical_flags', [])
+        technical_flags = '; '.join(flags) if flags else 'None'
+ 
+        user_prompt = CAB_INTERROGATE_USER.format(
+            ticket_number       = change_data.get('ticket_number', 'N/A'),
+            change_type         = change_data.get('change_type', 'Normal'),
+            priority            = change_data.get('priority', '3'),
+            risk_level          = change_data.get('risk_level', 'Medium'),
+            requester           = change_data.get('requester', 'Not specified'),
+            service             = change_data.get('service', 'Not specified'),
+            change_window       = change_window,
+            cis_section         = ', '.join(ci_names) if ci_names else 'None declared',
+            description         = self._truncate_context(change_data.get('description', ''), 350),
+            implementation_plan = self._truncate_context(change_data.get('implementation_plan', ''), 450),
+            rollback_plan       = self._truncate_context(change_data.get('rollback_plan', ''), 300),
+            test_plan           = self._truncate_context(change_data.get('test_plan', ''), 150),
+            tasks_section       = self._build_tasks_section(tasks),
+            attachments_section = build_attachments_section(
+                change_data.get('attachments_with_paths', [])
+            ),
+            domain              = checklist_context.get('domain', 'unknown'),
+            confidence          = f"{int(checklist_context.get('confidence', 0) * 100)}%",
+            technical_flags     = technical_flags,
+        )
+ 
+        try:
+            raw    = self._call(CAB_INTERROGATE_SYSTEM, user_prompt)
+            result = _extract_json(raw)
+            # Normalise
+            if 'challenges' not in result:
+                result['challenges'] = []
+            result.setdefault('overall_risk', 'HIGH')
+            result.setdefault('risk_justification', 'See individual challenges.')
+            return result
+        except Exception as e:
+            logger.exception(f"CAB interrogation generation failed: {e}")
+            raise
+        finally:
+            self.model_id   = original_model
+            self.max_tokens = original_max_tokens
+ 
+    def evaluate_cab_justification(
+        self,
+        finding: str,
+        source_ref: str,
+        acceptance_criteria: str,
+        justification: str,
+    ) -> dict:
+        """
+        Evaluate a single justification against a challenge's acceptance criteria.
+        Uses Llama 3.3 70B for nuanced evaluation.
+        Returns {result: SATISFIED|ESCALATED, verdict: str, criteria_results: list}
+        """
+        from .prompts_cab import CAB_EVALUATE_SYSTEM, CAB_EVALUATE_USER
+ 
+        original_model      = self.model_id
+        original_max_tokens = self.max_tokens
+        self.model_id   = 'meta-llama/llama-3-3-70b-instruct'
+        self.max_tokens = 600  # evaluation response is short
+ 
+        user_prompt = CAB_EVALUATE_USER.format(
+            source_ref          = source_ref,
+            finding             = finding,
+            acceptance_criteria = acceptance_criteria,
+            justification       = justification,
+        )
+ 
+        try:
+            raw    = self._call(CAB_EVALUATE_SYSTEM, user_prompt)
+            result = _extract_json(raw)
+            result.setdefault('result', 'ESCALATED')
+            result.setdefault('verdict', 'Evaluation inconclusive.')
+            result.setdefault('criteria_results', [])
+            # Normalise result to valid values
+            if result['result'] not in ('SATISFIED', 'ESCALATED'):
+                result['result'] = 'ESCALATED'
+            return result
+        except Exception as e:
+            logger.exception(f"CAB justification evaluation failed: {e}")
+            raise
+        finally:
+            self.model_id   = original_model
+            self.max_tokens = original_max_tokens
+ 
+    def generate_cab_final_brief(
+        self,
+        ticket_number: str,
+        change_type: str,
+        short_description: str,
+        change_window: str,
+        challenges_summary: str,
+        timestamp: str,
+    ) -> str:
+        """
+        Generate the final printable CAB brief after interrogation is complete.
+        Returns plain markdown text.
+        """
+        from .prompts_cab import CAB_SUMMARY_SYSTEM, CAB_SUMMARY_USER
+ 
+        original_model      = self.model_id
+        original_max_tokens = self.max_tokens
+        self.model_id   = 'meta-llama/llama-3-3-70b-instruct'
+        self.max_tokens = 1200
+ 
+        user_prompt = CAB_SUMMARY_USER.format(
+            ticket_number      = ticket_number,
+            change_type        = change_type,
+            short_description  = short_description,
+            change_window      = change_window,
+            challenges_summary = challenges_summary,
+            timestamp          = timestamp,
+        )
+ 
+        try:
+            brief = self._call(CAB_SUMMARY_SYSTEM, user_prompt)
+            return brief.strip()
+        except Exception as e:
+            logger.exception(f"CAB final brief generation failed: {e}")
+            raise
+        finally:
+            self.model_id   = original_model
+            self.max_tokens = original_max_tokens

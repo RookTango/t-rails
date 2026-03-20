@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { ChevronLeft, Save, Paperclip, Send, CalendarCheck, FileText, StickyNote, CheckSquare, MessageSquare, Network, Lock, AlertCircle, Upload, FlaskConical } from 'lucide-react';
+import { ChevronLeft, Save, Paperclip, Send, CalendarCheck, FileText, StickyNote, CheckSquare, MessageSquare, Network, Lock, AlertCircle, Upload, FlaskConical, Shield } from 'lucide-react';
 import { getChange, updateChange, transitionChange, addComment, uploadAttachment } from '../api/changes';
 import { PhasePipeline } from '../components/changes/PhasePipeline';
 import { TasksSection } from '../components/changes/TasksSection';
@@ -11,6 +11,7 @@ import { StatusBadge } from '../components/common/StatusBadge';
 import { FormField, TextInput, SelectInput, TextArea, DateTimeInput } from '../components/common/FormField';
 import { VALID_TRANSITIONS, STATUS_CONFIG } from '../utils/statusConfig';
 import { useAuth } from '../context/AuthContext';
+import { CABBriefPanel } from '../components/watson/CABBriefPanel';
 
 const CATEGORY_OPTS   = [['','(Select)'],['Software','Software'],['Hardware','Hardware'],['Network','Network'],['Database','Database'],['Security','Security'],['Other','Other']];
 const TYPE_OPTS       = [['Standard','Standard'],['Normal','Normal'],['Emergency','Emergency']];
@@ -37,12 +38,15 @@ const BOTTOM_TABS = [
 ];
 
 const TOP_TABS = [
-  { key: 'planning', label: 'Planning',            icon: FileText     },
+  { key: 'planning', label: 'Planning',            icon: FileText      },
   { key: 'schedule', label: 'Schedule',            icon: CalendarCheck },
-  { key: 'notes',    label: 'Notes',               icon: StickyNote   },
-  { key: 'closure',  label: 'Closure Information', icon: CheckSquare  },
+  { key: 'notes',    label: 'Notes',               icon: StickyNote    },
+  { key: 'closure',  label: 'Closure Information', icon: CheckSquare   },
   { key: 'activity', label: 'Activity',            icon: MessageSquare },
 ];
+
+// Phases where CAB brief is relevant
+const CAB_BRIEF_PHASES = new Set(['ASSESS', 'AUTHORIZE', 'SCHEDULED']);
 
 function SectionHeader({ title }) {
   return (
@@ -93,7 +97,6 @@ function TabBar({ tabs, active, onChange }) {
         }}>
           {Icon && <Icon size={13} />}
           {label}
-          {/* Badge for Watson Complex tab */}
           {key === 'watson-deep' && (
             <span style={{ fontSize: 9, fontWeight: 700, padding: '1px 5px', borderRadius: 8, background: active === key ? '#0369a1' : '#e0f2fe', color: active === key ? '#fff' : '#0369a1', marginLeft: 2 }}>
               70B
@@ -109,16 +112,17 @@ export default function ChangeDetailPage() {
   const { id } = useParams();
   const navigate = useNavigate();
   const { user } = useAuth();
-  const [change, setChange] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
-  const [topTab, setTopTab] = useState('planning');
-  const [bottomTab, setBottomTab] = useState('cis');
-  const [comment, setComment] = useState('');
-  const [form, setForm] = useState({});
-  const [dirty, setDirty] = useState(false);
+  const [change, setChange]               = useState(null);
+  const [loading, setLoading]             = useState(true);
+  const [saving, setSaving]               = useState(false);
+  const [topTab, setTopTab]               = useState('planning');
+  const [bottomTab, setBottomTab]         = useState('cis');
+  const [comment, setComment]             = useState('');
+  const [form, setForm]                   = useState({});
+  const [dirty, setDirty]                 = useState(false);
   const [transitionError, setTransitionError] = useState('');
   const [transitioning, setTransitioning] = useState(false);
+  const [showCABBrief, setShowCABBrief]   = useState(false);
 
   const load = useCallback(() => {
     return getChange(id).then(r => {
@@ -170,10 +174,11 @@ export default function ChangeDetailPage() {
   if (loading) return <div style={{ padding: 40, textAlign: 'center', color: 'var(--sn-text-muted)' }}>Loading...</div>;
   if (!change)  return <div style={{ padding: 40, textAlign: 'center', color: '#dc2626' }}>Record not found</div>;
 
-  const transitions = VALID_TRANSITIONS[change.status] || [];
-  const userRole    = user?.role || '';
-  const btnBase     = { padding: '4px 12px', borderRadius: 3, fontSize: 13, fontWeight: 600, cursor: 'pointer', fontFamily: 'inherit', border: 'none', display: 'inline-flex', alignItems: 'center', gap: 5 };
-  const dt          = (val) => val ? new Date(val).toLocaleString() : '—';
+  const transitions       = VALID_TRANSITIONS[change.status] || [];
+  const userRole          = user?.role || '';
+  const showCABBriefBtn   = CAB_BRIEF_PHASES.has(change.status);
+  const btnBase           = { padding: '4px 12px', borderRadius: 3, fontSize: 13, fontWeight: 600, cursor: 'pointer', fontFamily: 'inherit', border: 'none', display: 'inline-flex', alignItems: 'center', gap: 5 };
+  const dt                = (val) => val ? new Date(val).toLocaleString() : '—';
 
   return (
     <div style={{ animation: 'fadeIn 0.2s ease', paddingBottom: 40 }}>
@@ -187,11 +192,29 @@ export default function ChangeDetailPage() {
         <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--sn-blue)' }}>{change.ticket_number}</span>
         <StatusBadge status={change.status} />
         <div style={{ flex: 1 }} />
+
         {dirty && (
           <button onClick={handleSave} disabled={saving} style={{ ...btnBase, background: 'var(--sn-green)', color: '#fff' }}>
             <Save size={13} /> {saving ? 'Saving...' : 'Save'}
           </button>
         )}
+
+        {/* CAB Brief button — visible during ASSESS, AUTHORIZE, SCHEDULED */}
+        {showCABBriefBtn && (
+          <button
+            onClick={() => setShowCABBrief(true)}
+            style={{
+              ...btnBase,
+              background: '#0f172a',
+              color: '#fff',
+              border: '1px solid #334155',
+              gap: 6,
+            }}>
+            <Shield size={13} />
+            CAB Brief
+          </button>
+        )}
+
         {transitions.map(ts => {
           const required = TRANSITION_ROLE_REQUIRED[ts] || [];
           const allowed  = required.length === 0 || required.includes(userRole);
@@ -281,7 +304,9 @@ export default function ChangeDetailPage() {
               </FormField>
 
               <SectionHeader title="Assignment" />
-              <FormField label="Assigned to"><TextInput value={change.assigned_to_detail ? `${change.assigned_to_detail.first_name || ''} ${change.assigned_to_detail.last_name || ''}`.trim() : ''} disabled /></FormField>
+              <FormField label="Assigned to">
+                <TextInput value={change.assigned_to_detail ? `${change.assigned_to_detail.first_name || ''} ${change.assigned_to_detail.last_name || ''}`.trim() : ''} disabled />
+              </FormField>
               <FormField label="Assignment group"><TextInput value={form.assignment_group} onChange={e => setField('assignment_group', e.target.value)} /></FormField>
               <FormField label="Requester"><TextInput value={`${change.requester?.first_name || ''} ${change.requester?.last_name || ''}`.trim()} disabled /></FormField>
             </FormGrid>
@@ -295,10 +320,10 @@ export default function ChangeDetailPage() {
         {topTab === 'planning' && (
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
             {[
-              ['Justification',       'justification',       'Why is this change needed?'],
-              ['Implementation Plan', 'implementation_plan', 'Step-by-step approach'],
-              ['Rollback Plan',       'rollback_plan',       'How to revert if things go wrong'],
-              ['Test Plan',           'test_plan',           'How to validate success'],
+              ['Justification',       'justification',       'Why is this change needed?'         ],
+              ['Implementation Plan', 'implementation_plan', 'Step-by-step approach'              ],
+              ['Rollback Plan',       'rollback_plan',       'How to revert if things go wrong'   ],
+              ['Test Plan',           'test_plan',           'How to validate success'            ],
             ].map(([label, field, ph]) => (
               <div key={field}>
                 <div style={{ fontSize: 12, color: 'var(--sn-text-label)', marginBottom: 4 }}>{label}</div>
@@ -362,6 +387,14 @@ export default function ChangeDetailPage() {
           {bottomTab === 'watson-deep' && <WatsonDeepChecklist change={change} />}
         </div>
       </div>
+
+      {/* ── CAB Brief overlay panel ── */}
+      {showCABBrief && (
+        <CABBriefPanel
+          change={change}
+          onClose={() => setShowCABBrief(false)}
+        />
+      )}
     </div>
   );
 }

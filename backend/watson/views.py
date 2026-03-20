@@ -897,3 +897,464 @@ class PassiveScoreDeepView(APIView):
             },
             "needs_human_review": disagree_count > 0,
         })
+
+#----------------- CAB ------------------------
+class GenerateCABBriefView(APIView):
+    """
+    POST /api/watson/changes/<pk>/cab-brief/
+ 
+    Generates a CAB Intelligence Brief for non-technical board members.
+    Available during AUTHORIZE phase (when CAB is reviewing).
+    Also available in ASSESS for preview.
+ 
+    NOT persisted — generated on demand each time.
+    Returns plain markdown text.
+    """
+ 
+    def post(self, request, pk):
+        try:
+            change = ChangeRequest.objects.prefetch_related(
+                'tasks', 'attachments', 'change_cis__ci', 'activity_logs'
+            ).get(pk=pk)
+        except ChangeRequest.DoesNotExist:
+            return Response({'error': 'Change not found'}, status=404)
+ 
+        if change.status not in ('ASSESS', 'AUTHORIZE', 'SCHEDULED'):
+            return Response({
+                'error': f'CAB brief is available during ASSESS and AUTHORIZE phases. Current: {change.status}',
+            }, status=400)
+ 
+        # Load existing checklist context — avoid re-deriving what we already know
+        checklist_context = {'domain': 'unknown', 'confidence': 0, 'technical_flags': []}
+        active_checklist = WatsonChecklist.objects.filter(
+            change=change
+        ).exclude(
+            status=WatsonChecklist.Status.SUPERSEDED
+        ).order_by('-generated_at').first()
+ 
+        if active_checklist:
+            checklist_context['domain']     = active_checklist.json_artifact.get('domain', 'unknown')
+            checklist_context['confidence'] = float(active_checklist.confidence or 0)
+ 
+            # Extract technical flags from checklist items
+            # AI-GENERATED and UNSURE items are risk signals for CAB
+            from watson.models import ChecklistItem
+            flagged_items = ChecklistItem.objects.filter(
+                group__checklist=active_checklist,
+                confidence_flag__in=('AI-GENERATED', 'UNSURE'),
+            ).values_list('description', flat=True)[:5]
+ 
+            checklist_context['technical_flags'] = [
+                f"Uncertain: {desc[:80]}" for desc in flagged_items
+            ]
+ 
+        # Add requester info to payload
+        payload = _build_payload(change)
+        payload['requester'] = (
+            f"{change.requester.first_name} {change.requester.last_name}".strip()
+            if change.requester else 'Not specified'
+        )
+ 
+        try:
+            engine = get_watson_engine()
+ 
+            if not hasattr(engine, 'generate_cab_brief'):
+                return Response({
+                    'error': 'CAB brief requires IBM Watson engine.',
+                    'hint':  'Set WATSON_MODE=ibm in .env'
+                }, status=400)
+ 
+            brief = engine.generate_cab_brief(payload, checklist_context)
+ 
+            # Log the generation
+            ActivityLog.objects.create(
+                change      = change,
+                user        = request.user,
+                action_type = 'WATSON_ACTION',
+                message     = f'CAB Intelligence Brief generated for {change.ticket_number}.',
+                metadata    = {'generated_by': request.user.username}
+            )
+ 
+            return Response({
+                'brief':      brief,
+                'change':     change.ticket_number,
+                'status':     change.status,
+                'generated_at': timezone.now().isoformat(),
+                'has_checklist': active_checklist is not None,
+                'domain':     checklist_context['domain'],
+            })
+ 
+        except Exception as e:
+            logger.exception(f"CAB brief failed for {change.ticket_number}: {e}")
+            return Response({
+                'error':  'CAB brief generation failed.',
+                'detail': str(e)[:200],
+            }, status=502)
+
+import json
+import logging
+from django.utils import timezone
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated
+ 
+from .models import WatsonChecklist, ChecklistGroup, ChecklistItem, CABChallenge
+from .engine.factory import get_watson_engine
+from changes.models import ChangeRequest, ActivityLog
+ 
+logger = logging.getLogger(__name__)
+ 
+ 
+# ── Serialiser helper ──────────────────────────────────────────────────────
+ 
+def _serialise_challenge(c):
+    return {
+        'id':                   c.id,
+        'source_type':          c.source_type,
+        'source_ref':           c.source_ref,
+        'finding':              c.finding,
+        'severity':             c.severity,
+        'acceptance_criteria':  c.acceptance_criteria,
+        'status':               c.status,
+        'justification':        c.justification,
+        'resolution_note':      c.resolution_note,
+        'resolved_at':          c.resolved_at.isoformat() if c.resolved_at else None,
+        'resolved_by':          c.resolved_by.get_full_name() if c.resolved_by else None,
+        'resubmit_count':       c.resubmit_count,
+        'linked_item_code':     c.linked_item.code if c.linked_item else None,
+        'checklist_hint':       '',
+    }
+ 
+ 
+# ── View 1 — Generate interrogation ───────────────────────────────────────
+ 
+class GenerateInterrogationView(APIView):
+    """
+    POST /api/watson/changes/<pk>/cab-interrogate/
+ 
+    Generates a structured list of CABChallenge objects for a change.
+    Supersedes any previous challenges for this change.
+    Available during ASSESS, AUTHORIZE, SCHEDULED.
+    """
+ 
+    def post(self, request, pk):
+        try:
+            change = ChangeRequest.objects.prefetch_related(
+                'tasks', 'attachments', 'change_cis__ci', 'activity_logs'
+            ).get(pk=pk)
+        except ChangeRequest.DoesNotExist:
+            return Response({'error': 'Change not found'}, status=404)
+ 
+        if change.status not in ('ASSESS', 'AUTHORIZE', 'SCHEDULED'):
+            return Response({
+                'error': f'CAB interrogation is available during ASSESS, AUTHORIZE, and SCHEDULED phases. Current: {change.status}'
+            }, status=400)
+ 
+        # Supersede previous challenges
+        CABChallenge.objects.filter(change=change).delete()
+ 
+        # Load existing checklist context
+        checklist_context = {'domain': 'unknown', 'confidence': 0, 'technical_flags': []}
+        active_checklist = WatsonChecklist.objects.filter(
+            change=change,
+            is_deep_analysis=False,
+        ).exclude(
+            status=WatsonChecklist.Status.SUPERSEDED
+        ).order_by('-generated_at').first()
+ 
+        if active_checklist:
+            checklist_context['domain']     = active_checklist.json_artifact.get('domain', 'unknown')
+            checklist_context['confidence'] = float(active_checklist.confidence or 0)
+            flagged = ChecklistItem.objects.filter(
+                group__checklist=active_checklist,
+                confidence_flag__in=('AI-GENERATED', 'UNSURE'),
+            ).values_list('description', flat=True)[:5]
+            checklist_context['technical_flags'] = [f"Uncertain: {d[:80]}" for d in flagged]
+ 
+        payload = _build_payload(change)
+        payload['requester'] = (
+            f"{change.requester.first_name} {change.requester.last_name}".strip()
+            if change.requester else 'Not specified'
+        )
+ 
+        try:
+            engine = get_watson_engine()
+            if not hasattr(engine, 'generate_cab_interrogation'):
+                return Response({
+                    'error': 'CAB interrogation requires IBM Watson engine.',
+                    'hint':  'Set WATSON_MODE=ibm in .env'
+                }, status=400)
+ 
+            result = engine.generate_cab_interrogation(payload, checklist_context)
+ 
+        except Exception as e:
+            logger.exception(f"CAB interrogation failed for {change.ticket_number}: {e}")
+            return Response({
+                'error':  'CAB interrogation generation failed.',
+                'detail': str(e)[:200],
+            }, status=502)
+ 
+        # Persist challenges
+        challenges_data = result.get('challenges', [])
+        saved = []
+ 
+        # Build checklist item map for linking
+        item_map = {}
+        if active_checklist:
+            for item in ChecklistItem.objects.filter(
+                group__checklist=active_checklist
+            ).select_related('group'):
+                item_map[item.code] = item
+ 
+        for i, cd in enumerate(challenges_data):
+            linked_item = None
+            hint = cd.get('checklist_hint', '')
+            if hint and hint in item_map:
+                linked_item = item_map[hint]
+ 
+            challenge = CABChallenge.objects.create(
+                change               = change,
+                source_type          = cd.get('source_type', 'GENERAL'),
+                source_ref           = cd.get('source_ref', 'General'),
+                finding              = cd.get('finding', ''),
+                severity             = cd.get('severity', 'MEDIUM'),
+                acceptance_criteria  = cd.get('acceptance_criteria', ''),
+                order                = i,
+                linked_item          = linked_item,
+            )
+            saved.append(_serialise_challenge(challenge))
+ 
+        ActivityLog.objects.create(
+            change      = change,
+            user        = request.user,
+            action_type = 'WATSON_ACTION',
+            message     = f"CAB Interrogation generated: {len(saved)} challenges. Overall risk: {result.get('overall_risk', 'UNKNOWN')}.",
+            metadata    = {
+                'overall_risk':       result.get('overall_risk'),
+                'risk_justification': result.get('risk_justification'),
+            }
+        )
+ 
+        return Response({
+            'overall_risk':       result.get('overall_risk', 'HIGH'),
+            'risk_justification': result.get('risk_justification', ''),
+            'challenges':         saved,
+            'challenge_count':    len(saved),
+        }, status=201)
+ 
+ 
+# ── View 2 — Evaluate a single justification ──────────────────────────────
+ 
+class EvaluateJustificationView(APIView):
+    """
+    POST /api/watson/cab-challenges/<pk>/evaluate/
+ 
+    Takes a justification text and evaluates it against the challenge's
+    acceptance criteria. Updates challenge status to SATISFIED or ESCALATED.
+    On SATISFIED, optionally updates the linked ChecklistItem.
+    """
+ 
+    def post(self, request, pk):
+        try:
+            challenge = CABChallenge.objects.select_related(
+                'change', 'linked_item', 'linked_item__group'
+            ).get(pk=pk)
+        except CABChallenge.DoesNotExist:
+            return Response({'error': 'Challenge not found'}, status=404)
+ 
+        justification = request.data.get('justification', '').strip()
+        if not justification:
+            return Response({'error': 'justification is required.'}, status=400)
+ 
+        if len(justification) < 20:
+            return Response({
+                'error': 'Justification is too brief. Provide specific evidence addressing each acceptance criterion.'
+            }, status=400)
+ 
+        try:
+            engine = get_watson_engine()
+            if not hasattr(engine, 'evaluate_cab_justification'):
+                return Response({
+                    'error': 'Evaluation requires IBM Watson engine.'
+                }, status=400)
+ 
+            result = engine.evaluate_cab_justification(
+                finding             = challenge.finding,
+                source_ref          = challenge.source_ref,
+                acceptance_criteria = challenge.acceptance_criteria,
+                justification       = justification,
+            )
+ 
+        except Exception as e:
+            logger.exception(f"CAB evaluation failed for challenge {pk}: {e}")
+            return Response({
+                'error':  'Evaluation failed.',
+                'detail': str(e)[:200],
+            }, status=502)
+ 
+        # Update challenge
+        challenge.justification   = justification
+        challenge.resolution_note = result.get('verdict', '')
+        challenge.resolved_by     = request.user
+        challenge.resolved_at     = timezone.now()
+        challenge.resubmit_count  += 1
+ 
+        if result.get('result') == 'SATISFIED':
+            challenge.status = CABChallenge.Status.SATISFIED
+ 
+            # Update linked checklist item if present
+            # The accepted justification becomes stronger technical criteria
+            if challenge.linked_item:
+                item = challenge.linked_item
+                existing = item.technical_criteria or ''
+                item.technical_criteria = (
+                    f"{existing}\n\nCAB APPROVED CRITERIA: {justification}"
+                ).strip()
+                item.acceptance_note = f"CAB Challenge satisfied: {result.get('verdict', '')}"
+                item.save(update_fields=['technical_criteria', 'acceptance_note'])
+ 
+        else:
+            challenge.status = CABChallenge.Status.ESCALATED
+ 
+        challenge.save()
+ 
+        return Response({
+            'result':           result.get('result'),
+            'verdict':          result.get('verdict', ''),
+            'criteria_results': result.get('criteria_results', []),
+            'challenge':        _serialise_challenge(challenge),
+        })
+ 
+ 
+# ── View 3 — List challenges for a change ─────────────────────────────────
+ 
+class CABChallengeListView(APIView):
+    """GET /api/watson/changes/<pk>/cab-challenges/"""
+ 
+    def get(self, request, pk):
+        try:
+            change = ChangeRequest.objects.get(pk=pk)
+        except ChangeRequest.DoesNotExist:
+            return Response({'error': 'Not found'}, status=404)
+ 
+        challenges = CABChallenge.objects.filter(
+            change=change
+        ).select_related('resolved_by', 'linked_item').order_by('order', '-severity')
+ 
+        total      = challenges.count()
+        open_count = challenges.filter(status=CABChallenge.Status.OPEN).count()
+        justified  = challenges.filter(status=CABChallenge.Status.JUSTIFIED).count()
+        satisfied  = challenges.filter(status=CABChallenge.Status.SATISFIED).count()
+        escalated  = challenges.filter(status=CABChallenge.Status.ESCALATED).count()
+ 
+        return Response({
+            'stats': {
+                'total':     total,
+                'open':      open_count,
+                'justified': justified,
+                'satisfied': satisfied,
+                'escalated': escalated,
+                'resolved':  satisfied + escalated,
+            },
+            'challenges': [_serialise_challenge(c) for c in challenges],
+        })
+ 
+ 
+# ── View 4 — Generate final brief ─────────────────────────────────────────
+ 
+class GenerateFinalBriefView(APIView):
+    """
+    POST /api/watson/changes/<pk>/cab-final-brief/
+ 
+    Generates the final printable CAB brief after interrogation is complete.
+    Summarises what was challenged, what was accepted, what escalated.
+    Available when at least one challenge exists.
+    """
+ 
+    def post(self, request, pk):
+        try:
+            change = ChangeRequest.objects.get(pk=pk)
+        except ChangeRequest.DoesNotExist:
+            return Response({'error': 'Not found'}, status=404)
+ 
+        challenges = CABChallenge.objects.filter(
+            change=change
+        ).order_by('order')
+ 
+        if not challenges.exists():
+            return Response({
+                'error': 'No challenges found. Run the CAB interrogation first.'
+            }, status=400)
+ 
+        # Build summary for prompt
+        lines = []
+        for c in challenges:
+            status_sym = '✓' if c.status == CABChallenge.Status.SATISFIED else (
+                '✗' if c.status == CABChallenge.Status.ESCALATED else '○'
+            )
+            lines.append(
+                f"{status_sym} [{c.source_ref}] {c.severity} — {c.finding}"
+            )
+            if c.justification:
+                lines.append(f"   Presenter: {c.justification[:200]}")
+            if c.resolution_note:
+                lines.append(f"   Watson: {c.resolution_note[:200]}")
+ 
+        challenges_summary = '\n'.join(lines)
+ 
+        satisfied = challenges.filter(status=CABChallenge.Status.SATISFIED).count()
+        escalated = challenges.filter(status=CABChallenge.Status.ESCALATED).count()
+        open_ct   = challenges.filter(status=CABChallenge.Status.OPEN).count()
+ 
+        try:
+            engine = get_watson_engine()
+            if not hasattr(engine, 'generate_cab_final_brief'):
+                return Response({'error': 'Requires IBM Watson engine.'}, status=400)
+ 
+            brief = engine.generate_cab_final_brief(
+                ticket_number      = change.ticket_number,
+                change_type        = change.change_type,
+                short_description  = change.short_description,
+                change_window      = (
+                    f"{change.change_window_start} to {change.change_window_end}"
+                    if change.change_window_start else 'Not specified'
+                ),
+                challenges_summary = challenges_summary,
+                timestamp          = timezone.now().strftime('%Y-%m-%d %H:%M UTC'),
+            )
+ 
+        except Exception as e:
+            logger.exception(f"Final brief failed for {change.ticket_number}: {e}")
+            return Response({
+                'error':  'Final brief generation failed.',
+                'detail': str(e)[:200],
+            }, status=502)
+ 
+        # Determine final outcome
+        if escalated > 0:
+            outcome = 'ESCALATED TO SENIOR CAB'
+        elif open_ct > 0:
+            outcome = 'INCOMPLETE — OPEN CHALLENGES REMAIN'
+        else:
+            outcome = 'APPROVED WITH CONDITIONS' if satisfied > 0 else 'APPROVED'
+ 
+        ActivityLog.objects.create(
+            change      = change,
+            user        = request.user,
+            action_type = 'WATSON_ACTION',
+            message     = f"CAB Final Brief generated. Outcome: {outcome}. {satisfied} satisfied, {escalated} escalated.",
+            metadata    = {'outcome': outcome, 'satisfied': satisfied, 'escalated': escalated}
+        )
+ 
+        return Response({
+            'brief':   brief,
+            'outcome': outcome,
+            'stats': {
+                'satisfied': satisfied,
+                'escalated': escalated,
+                'open':      open_ct,
+                'total':     challenges.count(),
+            },
+            'generated_at': timezone.now().isoformat(),
+        })
+ 

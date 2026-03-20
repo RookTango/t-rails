@@ -1,7 +1,7 @@
 from django.urls import path
 from .views import (
-    GenerateChecklistView, ChecklistDetailView,
-    ChecklistItemAcceptView, PassiveScoreView, ExportChecklistJSON,
+    CABChallengeListView, EvaluateJustificationView, GenerateCABBriefView, GenerateChecklistView, ChecklistDetailView,
+    ChecklistItemAcceptView, GenerateFinalBriefView, GenerateInterrogationView, PassiveScoreView, ExportChecklistJSON,
     GenerateChecklistDeepView, ChecklistDeepDetailView, PassiveScoreDeepView,  # NEW
 )
  
@@ -15,4 +15,9 @@ urlpatterns = [
     path("changes/<int:pk>/generate-deep/",       GenerateChecklistDeepView.as_view()),
     path("changes/<int:pk>/checklist-deep/",      ChecklistDeepDetailView.as_view()),
     path("changes/<int:pk>/passive-score-deep/",  PassiveScoreDeepView.as_view()),
+    path('changes/<int:pk>/cab-brief/', GenerateCABBriefView.as_view()),
+    path('changes/<int:pk>/cab-interrogate/',        GenerateInterrogationView.as_view()),
+    path('cab-challenges/<int:pk>/evaluate/',        EvaluateJustificationView.as_view()),
+    path('changes/<int:pk>/cab-final-brief/',        GenerateFinalBriefView.as_view()),
+    path('changes/<int:pk>/cab-challenges/',         CABChallengeListView.as_view()),
 ]
